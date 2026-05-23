@@ -1,0 +1,18 @@
+{
+  "orders": [
+    {"id": "o1", "value": 3.0},
+    {"id": "o2", "value": 2.0},
+    {"id": "o3", "value": 1.0}
+  ],
+  "riders": [
+    {"id": "r1", "capacity": 2, "willingness": 1.0},
+    {"id": "r2", "capacity": 1, "willingness": 0.8}
+  ],
+  "options": [
+    {"order_id": "o1", "rider_id": "r1", "cost": 4.0},
+    {"order_id": "o1", "rider_id": "r2", "cost": 3.0},
+    {"order_id": "o2", "rider_id": "r1", "cost": 2.0},
+    {"order_id": "o2", "rider_id": "r2", "cost": 5.0},
+    {"order_id": "o3", "rider_id": "r1", "cost": 1.0}
+  ]
+}

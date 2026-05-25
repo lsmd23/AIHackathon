@@ -1,15 +1,15 @@
-# Hackathon AutoSolver
+# AIHackathon AutoSolver
 
-AutoSolver is an initial competition framework for an AI Agent that autonomously explores and solves delivery order dispatching problems.
+AutoSolver is a competition solver for the official precomputed dispatch candidate format.
 
-The target problem is to assign delivery tasks to riders under time, distance, rider willingness, order rejection, and bundle delivery constraints. The system should maximize accepted orders and minimize the total score/cost within the competition time limit.
+The current task is to choose non-conflicting task-bundle/courier candidates from a TSV input. The solver should cover as many tasks as possible, then minimize total score, with courier willingness as a secondary signal.
 
 ## Goals
 
-- Provide a clear implementation plan for a two-person team.
-- Keep a runnable baseline solver from day one.
-- Leave extension points for greedy, ILP, heuristic search, and LLM-guided strategy selection.
-- Standardize repository structure, data models, tests, and CLI entry points.
+- Match the official `solve(input_text: str) -> list` submission API.
+- Keep `solver.py` self-contained for upload.
+- Maintain a local package version for tests and strategy iteration.
+- Optimize candidate selection under task and courier conflict constraints.
 
 ## Quick Start
 
@@ -17,8 +17,28 @@ The target problem is to assign delivery tasks to riders under time, distance, r
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e .[dev]
-python -m autosolver_agent examples/sample_case.json
 pytest
+```
+
+## Competition Submission
+
+The current online judge requires a `solver.py` file with:
+
+```python
+def solve(input_text: str) -> list:
+    ...
+```
+
+The repository includes [solver.py](solver.py), which parses the official TSV candidate format and returns:
+
+```python
+[(task_id_list_str, [courier_id]), ...]
+```
+
+Local smoke test:
+
+```powershell
+python -c "from pathlib import Path; import solver; print(len(solver.solve(Path('examples/large_seed301.txt').read_text(encoding='utf-8'))))"
 ```
 
 ## Repository Structure
@@ -26,31 +46,31 @@ pytest
 ```text
 .
 ├── docs/
+│   ├── 0.md
 │   ├── architecture.md
+│   ├── baseline_evaluation.md
 │   └── contest_plan.md
 ├── examples/
-│   └── sample_case.json
+│   ├── example_solution.py
+│   └── large_seed301.txt
+├── solver.py
 ├── src/
 │   └── autosolver_agent/
-│       ├── agent.py
+│       ├── competition.py
 │       ├── cli.py
-│       ├── models.py
-│       ├── scoring.py
-│       ├── solver.py
-│       └── strategies/
-│           ├── base.py
-│           └── greedy.py
+│       └── __init__.py
 └── tests/
-    └── test_scoring.py
+    ├── test_competition.py
+    └── test_solver_submission.py
 ```
 
 ## Current Baseline
 
-The baseline implements a deterministic greedy strategy:
+The baseline implements a lightweight deterministic Agent:
 
-1. Sort orders by predicted benefit.
-2. Try every rider for each order.
-3. Accept the lowest incremental cost feasible assignment.
-4. Skip an order when no rider can serve it.
+1. Parse candidate rows from TSV.
+2. Compute metadata such as task count, courier count, score statistics, and bundle size.
+3. Choose `heuristic_search` for bundle-heavy cases, otherwise `greedy`.
+4. Select non-conflicting candidates and return official submission-shaped tuples.
 
-This is intentionally simple. It gives the team a stable reference for scoring, testing, and later strategy comparison.
+This baseline has passed the current public evaluation set: `10/10` cases, all with `100%` task coverage. See [baseline_evaluation.md](docs/baseline_evaluation.md).

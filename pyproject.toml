@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hackathon-autosolver"
 version = "0.1.0"
-description = "Initial AutoSolver Agent framework for delivery dispatch optimization."
+description = "Competition solver for precomputed dispatch candidate selection."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []

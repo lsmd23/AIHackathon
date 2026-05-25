@@ -4,34 +4,56 @@ import argparse
 import json
 from pathlib import Path
 
-from autosolver_agent.agent import AutoSolverAgent
-from autosolver_agent.models import ProblemInstance, Solution
+from autosolver_agent.competition import parse_competition_input, solve_competition_text
 
 
-def solution_to_dict(solution: Solution) -> dict[str, object]:
+def _metrics(input_text: str, result: list[tuple[str, list[str]]]) -> dict[str, object]:
+    instance = parse_competition_input(input_text)
+    score_by_pair = {
+        (candidate.task_id_list_str, candidate.courier_id): candidate.total_score
+        for candidate in instance.candidates
+    }
+    willingness_by_pair = {
+        (candidate.task_id_list_str, candidate.courier_id): candidate.willingness
+        for candidate in instance.candidates
+    }
+    covered_tasks = set()
+    used_couriers = set()
+    total_score = 0.0
+    total_willingness = 0.0
+
+    for task_id_list_str, courier_ids in result:
+        covered_tasks.update(task_id_list_str.split(","))
+        used_couriers.update(courier_ids)
+        for courier_id in courier_ids:
+            total_score += score_by_pair.get((task_id_list_str, courier_id), 0.0)
+            total_willingness += willingness_by_pair.get((task_id_list_str, courier_id), 0.0)
+
     return {
-        "strategy": solution.strategy_name,
-        "assignments": [
-            {"order_id": item.order_id, "rider_id": item.rider_id, "cost": item.cost}
-            for item in solution.assignments
-        ],
-        "metadata": solution.metadata,
+        "assignments": len(result),
+        "covered_tasks": len(covered_tasks),
+        "used_couriers": len(used_couriers),
+        "total_score": round(total_score, 3),
+        "total_willingness": round(total_willingness, 4),
     }
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run AutoSolver on a problem JSON file.")
-    parser.add_argument("input", type=Path, help="Path to problem JSON.")
+    parser = argparse.ArgumentParser(description="Run AutoSolver on official TSV input.")
+    parser.add_argument("input", type=Path, help="Path to official TSV input.")
     parser.add_argument("--output", type=Path, help="Optional path for solution JSON.")
     args = parser.parse_args()
 
-    payload = json.loads(args.input.read_text(encoding="utf-8"))
-    problem = ProblemInstance.from_dict(payload)
-    solution = AutoSolverAgent().run(problem)
-    result = solution_to_dict(solution)
+    input_text = args.input.read_text(encoding="utf-8")
+    result = solve_competition_text(input_text)
+    payload = {
+        "result": result,
+        "metrics": _metrics(input_text, result),
+    }
+    text = json.dumps(payload, ensure_ascii=False, indent=2)
 
-    text = json.dumps(result, ensure_ascii=False, indent=2)
     if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(text + "\n", encoding="utf-8")
     else:
         print(text)

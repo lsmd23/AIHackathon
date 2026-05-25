@@ -1,4 +1,13 @@
-from autosolver_agent.strategies.base import Strategy
-from autosolver_agent.strategies.greedy import GreedyStrategy
+from autosolver_agent.competition import (
+    branch_bound_algorithm,
+    greedy_algorithm,
+    heuristic_search_algorithm,
+    llm_direct_reasoning_algorithm,
+)
 
-__all__ = ["GreedyStrategy", "Strategy"]
+__all__ = [
+    "branch_bound_algorithm",
+    "greedy_algorithm",
+    "heuristic_search_algorithm",
+    "llm_direct_reasoning_algorithm",
+]

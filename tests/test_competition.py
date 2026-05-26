@@ -81,4 +81,4 @@ def test_branch_bound_prefers_more_covered_tasks_then_lower_score() -> None:
     result = branch_bound_algorithm(instance, metadata, time_limit_seconds=0.5)
 
     assert result.algorithm == "branch_bound"
-    assert result.to_submission() == [("T0001", ["C001"]), ("T0002", ["C002"])]
+    assert sorted(result.to_submission()) == [("T0001", ["C001"]), ("T0002", ["C002"])]

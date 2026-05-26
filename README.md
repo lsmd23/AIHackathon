@@ -2,7 +2,7 @@
 
 AutoSolver is a competition solver for the official precomputed dispatch candidate format.
 
-The current task is to choose non-conflicting task-bundle/courier candidates from a TSV input. The solver should cover as many tasks as possible, then minimize total score, with courier willingness as a secondary signal.
+The current task is to choose non-conflicting task-bundle/courier candidates from a TSV input. The solver should cover as many tasks as possible, minimize expected score, and use courier willingness as acceptance probability.
 
 ## Goals
 
@@ -51,6 +51,7 @@ python -c "from pathlib import Path; import solver; print(len(solver.solve(Path(
 │   ├── baseline_evaluation.md
 │   └── contest_plan.md
 ├── examples/
+│   ├── blackbox_like/
 │   ├── example_solution.py
 │   └── large_seed301.txt
 ├── solver.py
@@ -70,7 +71,28 @@ The baseline implements a lightweight deterministic Agent:
 
 1. Parse candidate rows from TSV.
 2. Compute metadata such as task count, courier count, score statistics, and bundle size.
-3. Choose `heuristic_search` for bundle-heavy cases, otherwise `greedy`.
-4. Select non-conflicting candidates and return official submission-shaped tuples.
+3. Run several heuristic task-partition strategies.
+4. For each strategy, assign multiple backup couriers per selected task bundle.
+5. Evaluate expected score and keep the best complete plan.
 
 This baseline has passed the current public evaluation set: `10/10` cases, all with `100%` task coverage. See [baseline_evaluation.md](docs/baseline_evaluation.md).
+
+## Local Cases
+
+Black-box-like TSV cases live in `examples/blackbox_like/`. Regenerate them with:
+
+```powershell
+python scripts\generate_blackbox_like_examples.py
+```
+
+Run the unified example-case interface with:
+
+```powershell
+python -m pytest tests\test_example_cases.py
+```
+
+Run the local score proxy:
+
+```powershell
+python scripts\evaluate_solver.py
+```

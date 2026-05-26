@@ -21,19 +21,32 @@ def _metrics(input_text: str, result: list[tuple[str, list[str]]]) -> dict[str, 
     used_couriers = set()
     total_score = 0.0
     total_willingness = 0.0
+    primary_score = 0.0
+    expected_score = 0.0
+    reject_penalty = max(100.0, max(score_by_pair.values(), default=100.0) * 3.0)
 
     for task_id_list_str, courier_ids in result:
         covered_tasks.update(task_id_list_str.split(","))
         used_couriers.update(courier_ids)
+        fail_probability = 1.0
         for courier_id in courier_ids:
-            total_score += score_by_pair.get((task_id_list_str, courier_id), 0.0)
-            total_willingness += willingness_by_pair.get((task_id_list_str, courier_id), 0.0)
+            score = score_by_pair.get((task_id_list_str, courier_id), 0.0)
+            willingness = willingness_by_pair.get((task_id_list_str, courier_id), 0.0)
+            total_score += score
+            total_willingness += willingness
+            expected_score += fail_probability * willingness * score
+            fail_probability *= 1.0 - willingness
+        expected_score += fail_probability * reject_penalty
+        if courier_ids:
+            primary_score += score_by_pair.get((task_id_list_str, courier_ids[0]), 0.0)
 
     return {
         "assignments": len(result),
         "covered_tasks": len(covered_tasks),
         "used_couriers": len(used_couriers),
-        "total_score": round(total_score, 3),
+        "primary_score": round(primary_score, 3),
+        "assigned_total_score": round(total_score, 3),
+        "expected_score": round(expected_score, 3),
         "total_willingness": round(total_willingness, 4),
     }
 

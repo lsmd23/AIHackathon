@@ -159,6 +159,7 @@ def heuristic_search_algorithm(instance: CompetitionInstance, metadata: ProblemM
     if not instance.candidates:
         return SolverResult((), "heuristic_search")
 
+    bundle_profiles = _bundle_profiles(instance.candidates, metadata)
     min_score_by_task: dict[str, float] = {}
     for candidate in instance.candidates:
         for task_id in candidate.task_id_list:
@@ -173,6 +174,20 @@ def heuristic_search_algorithm(instance: CompetitionInstance, metadata: ProblemM
     key_functions = [
         lambda item: (
             item.total_score / item.task_count,
+            item.total_score,
+            -item.willingness,
+            item.task_id_list_str,
+        ),
+        lambda item: (
+            bundle_profiles[item.task_id_list_str]["expected"] / item.task_count,
+            bundle_profiles[item.task_id_list_str]["fail_probability"],
+            item.total_score,
+            -item.willingness,
+            item.task_id_list_str,
+        ),
+        lambda item: (
+            bundle_profiles[item.task_id_list_str]["expected"] / item.task_count
+            - metadata.mean_willingness * bundle_profiles[item.task_id_list_str]["success_probability"],
             item.total_score,
             -item.willingness,
             item.task_id_list_str,
@@ -197,13 +212,335 @@ def heuristic_search_algorithm(instance: CompetitionInstance, metadata: ProblemM
         ),
     ]
 
+    def evaluated_result_key(selected: tuple[CandidateBundle, ...]) -> tuple[int, float, float]:
+        covered = {task_id for item in selected for task_id in item.task_id_list}
+        submission = assign_backup_couriers(instance.candidates, list(selected), metadata)
+        expected = expected_submission_score(instance.candidates, submission, metadata)
+        primary_score = sum(item.total_score for item in selected)
+        return (len(covered), -expected, -primary_score)
+
     best = SolverResult((), "heuristic_search")
     for key in key_functions:
         candidate_result = _greedy_by_key(instance.candidates, key, "heuristic_search")
-        if _is_better(candidate_result.selected, best.selected):
+        if evaluated_result_key(candidate_result.selected) > evaluated_result_key(best.selected):
             best = candidate_result
+    for selected in pair_first_candidates(instance.candidates, bundle_profiles):
+        selected_tuple = tuple(selected)
+        if evaluated_result_key(selected_tuple) > evaluated_result_key(best.selected):
+            best = SolverResult(selected_tuple, "heuristic_search")
+    for selected in minimum_group_candidates(instance.candidates, bundle_profiles):
+        selected_tuple = tuple(selected)
+        if evaluated_result_key(selected_tuple) > evaluated_result_key(best.selected):
+            best = SolverResult(selected_tuple, "heuristic_search")
+    if metadata.mean_willingness < 0.18:
+        for selected in low_willingness_candidates(instance.candidates, bundle_profiles):
+            selected_tuple = tuple(selected)
+            if evaluated_result_key(selected_tuple) > evaluated_result_key(best.selected):
+                best = SolverResult(selected_tuple, "heuristic_search")
 
-    return best
+    return SolverResult(
+        tuple(local_search_improve(instance.candidates, list(best.selected))),
+        "heuristic_search",
+    )
+
+
+def pair_first_candidates(
+    candidates: tuple[CandidateBundle, ...],
+    bundle_profiles: dict[str, dict[str, float]],
+) -> list[list[CandidateBundle]]:
+    pair_rows = [item for item in candidates if item.task_count == 2]
+    single_rows = [item for item in candidates if item.task_count == 1]
+    single_best: dict[str, CandidateBundle] = {}
+    for item in sorted(
+        single_rows,
+        key=lambda row: (row.total_score / max(row.willingness, 0.05), row.total_score, -row.willingness),
+    ):
+        single_best.setdefault(item.task_id_list[0], item)
+
+    sorters = [
+        lambda item: (
+            bundle_profiles[item.task_id_list_str]["expected"] / 2,
+            bundle_profiles[item.task_id_list_str]["fail_probability"],
+            item.total_score,
+            -item.willingness,
+        ),
+        lambda item: (
+            item.total_score / 2,
+            -bundle_profiles[item.task_id_list_str]["success_probability"],
+            item.total_score,
+            -item.willingness,
+        ),
+        lambda item: (
+            -bundle_profiles[item.task_id_list_str]["success_probability"],
+            bundle_profiles[item.task_id_list_str]["expected"] / 2,
+            item.total_score,
+        ),
+    ]
+
+    results: list[list[CandidateBundle]] = []
+    for sorter in sorters:
+        used_tasks: set[str] = set()
+        used_couriers: set[str] = set()
+        selected: list[CandidateBundle] = []
+        for item in sorted(pair_rows, key=sorter):
+            if any(task in used_tasks for task in item.task_id_list):
+                continue
+            if item.courier_id in used_couriers:
+                continue
+            selected.append(item)
+            used_tasks.update(item.task_id_list)
+            used_couriers.add(item.courier_id)
+        for task_id, item in single_best.items():
+            if task_id in used_tasks or item.courier_id in used_couriers:
+                continue
+            selected.append(item)
+            used_tasks.add(task_id)
+            used_couriers.add(item.courier_id)
+        results.append(selected)
+    return results
+
+
+def low_willingness_candidates(
+    candidates: tuple[CandidateBundle, ...],
+    bundle_profiles: dict[str, dict[str, float]],
+) -> list[list[CandidateBundle]]:
+    pair_rows = [item for item in candidates if item.task_count == 2]
+    single_rows = [item for item in candidates if item.task_count == 1]
+    single_best: dict[str, CandidateBundle] = {}
+    for item in sorted(
+        single_rows,
+        key=lambda row: (row.total_score / max(row.willingness, 0.03), row.total_score, -row.willingness),
+    ):
+        single_best.setdefault(item.task_id_list[0], item)
+
+    def pair_value(item: CandidateBundle) -> tuple[float, float, float, float]:
+        profile = bundle_profiles[item.task_id_list_str]
+        return (
+            profile["fail_probability"],
+            profile["expected"] / 2,
+            item.total_score / max(item.willingness, 0.03),
+            item.total_score,
+        )
+
+    results: list[list[CandidateBundle]] = []
+    for reverse_success in (False, True):
+        used_tasks: set[str] = set()
+        used_couriers: set[str] = set()
+        selected: list[CandidateBundle] = []
+        rows = sorted(
+            pair_rows,
+            key=(
+                (
+                    lambda item: (
+                        -bundle_profiles[item.task_id_list_str]["success_probability"],
+                        item.total_score / max(item.willingness, 0.03),
+                        item.total_score,
+                    )
+                )
+                if reverse_success
+                else pair_value
+            ),
+        )
+        for item in rows:
+            if any(task in used_tasks for task in item.task_id_list):
+                continue
+            if item.courier_id in used_couriers:
+                continue
+            selected.append(item)
+            used_tasks.update(item.task_id_list)
+            used_couriers.add(item.courier_id)
+        for task_id, item in single_best.items():
+            if task_id in used_tasks or item.courier_id in used_couriers:
+                continue
+            selected.append(item)
+            used_tasks.add(task_id)
+            used_couriers.add(item.courier_id)
+        results.append(selected)
+    return results
+
+
+def minimum_group_candidates(
+    candidates: tuple[CandidateBundle, ...],
+    bundle_profiles: dict[str, dict[str, float]],
+) -> list[list[CandidateBundle]]:
+    pair_rows = [item for item in candidates if item.task_count == 2]
+    single_rows = [item for item in candidates if item.task_count == 1]
+    single_best: dict[str, CandidateBundle] = {}
+    for item in sorted(single_rows, key=lambda row: (row.total_score, -row.willingness, row.courier_id)):
+        single_best.setdefault(item.task_id_list[0], item)
+
+    sorters = [
+        lambda item: (-item.task_count, bundle_profiles[item.task_id_list_str]["expected"] / 2, item.total_score),
+        lambda item: (-item.task_count, item.total_score / 2, -item.willingness, item.total_score),
+        lambda item: (
+            -item.task_count,
+            -bundle_profiles[item.task_id_list_str]["success_probability"],
+            bundle_profiles[item.task_id_list_str]["expected"],
+        ),
+    ]
+    results: list[list[CandidateBundle]] = []
+    for sorter in sorters:
+        used_tasks: set[str] = set()
+        used_couriers: set[str] = set()
+        selected: list[CandidateBundle] = []
+        for item in sorted(pair_rows, key=sorter):
+            if any(task in used_tasks for task in item.task_id_list) or item.courier_id in used_couriers:
+                continue
+            selected.append(item)
+            used_tasks.update(item.task_id_list)
+            used_couriers.add(item.courier_id)
+        for task_id, item in single_best.items():
+            if task_id in used_tasks or item.courier_id in used_couriers:
+                continue
+            selected.append(item)
+            used_tasks.add(task_id)
+            used_couriers.add(item.courier_id)
+        results.append(selected)
+    return results
+
+
+def _reject_penalty(metadata: ProblemMetadata) -> float:
+    return max(100.0, metadata.max_score * 3.0)
+
+
+def _bundle_profiles(
+    candidates: tuple[CandidateBundle, ...],
+    metadata: ProblemMetadata,
+    max_rows: int = 5,
+) -> dict[str, dict[str, float]]:
+    by_bundle: dict[str, list[CandidateBundle]] = {}
+    for candidate in candidates:
+        by_bundle.setdefault(candidate.task_id_list_str, []).append(candidate)
+
+    reject_penalty = _reject_penalty(metadata)
+    profiles: dict[str, dict[str, float]] = {}
+    for bundle, rows in by_bundle.items():
+        ranked = sorted(
+            rows,
+            key=lambda item: (
+                item.total_score / max(item.willingness, 0.05),
+                item.total_score,
+                -item.willingness,
+                item.courier_id,
+            ),
+        )
+        chosen: list[CandidateBundle] = []
+        used: set[str] = set()
+        for row in ranked:
+            if row.courier_id in used:
+                continue
+            chosen.append(row)
+            used.add(row.courier_id)
+            if len(chosen) >= max_rows:
+                break
+        fail_probability = 1.0
+        for row in chosen:
+            fail_probability *= 1.0 - max(0.0, min(1.0, row.willingness))
+        profiles[bundle] = {
+            "expected": _expected_bundle_score(chosen, reject_penalty),
+            "success_probability": 1.0 - fail_probability,
+            "fail_probability": fail_probability,
+        }
+    return profiles
+
+
+def local_search_improve(
+    candidates: tuple[CandidateBundle, ...],
+    selected: list[CandidateBundle],
+    time_limit_seconds: float = 1.0,
+) -> list[CandidateBundle]:
+    if not candidates or not selected:
+        return selected
+
+    start = perf_counter()
+    by_task_set: dict[frozenset[str], list[CandidateBundle]] = {}
+    for candidate in candidates:
+        by_task_set.setdefault(frozenset(candidate.task_id_list), []).append(candidate)
+    for rows in by_task_set.values():
+        rows.sort(key=lambda item: (item.total_score, -item.willingness, item.task_id_list_str, item.courier_id))
+
+    def selected_key(items: list[CandidateBundle]) -> tuple[int, float, float]:
+        return (
+            sum(item.task_count for item in items),
+            -sum(item.total_score for item in items),
+            sum(item.willingness for item in items),
+        )
+
+    def best_cover(
+        uncovered_tasks: set[str],
+        blocked_couriers: set[str],
+        max_items: int,
+    ) -> list[CandidateBundle]:
+        uncovered_frozen = frozenset(uncovered_tasks)
+        pool: list[CandidateBundle] = []
+        for task_set, rows in by_task_set.items():
+            if not task_set or not task_set.issubset(uncovered_frozen):
+                continue
+            for candidate in rows[:80]:
+                if candidate.courier_id not in blocked_couriers:
+                    pool.append(candidate)
+
+        pool_by_task: dict[str, list[CandidateBundle]] = {}
+        for candidate in pool:
+            for task_id in candidate.task_id_list:
+                pool_by_task.setdefault(task_id, []).append(candidate)
+
+        best: list[CandidateBundle] = []
+
+        def dfs(remaining: set[str], used_couriers: set[str], chosen: list[CandidateBundle]) -> None:
+            nonlocal best
+            if perf_counter() - start > time_limit_seconds:
+                return
+            if not remaining:
+                if not best or selected_key(chosen) > selected_key(best):
+                    best = list(chosen)
+                return
+            if len(chosen) >= max_items:
+                return
+
+            pivot = min(remaining, key=lambda task_id: len(pool_by_task.get(task_id, ())))
+            for candidate in pool_by_task.get(pivot, ()):
+                task_set = set(candidate.task_id_list)
+                if not task_set.issubset(remaining):
+                    continue
+                if candidate.courier_id in used_couriers:
+                    continue
+                chosen.append(candidate)
+                dfs(remaining - task_set, used_couriers | {candidate.courier_id}, chosen)
+                chosen.pop()
+
+        dfs(set(uncovered_tasks), set(), [])
+        return best
+
+    improved = True
+    while improved and perf_counter() - start <= time_limit_seconds:
+        improved = False
+        selected.sort(key=lambda item: (item.total_score / item.task_count, item.total_score), reverse=True)
+        index_groups = [(index,) for index in range(len(selected))]
+        index_groups.extend(
+            (left, right)
+            for left in range(len(selected))
+            for right in range(left + 1, len(selected))
+        )
+
+        for indexes in index_groups:
+            if perf_counter() - start > time_limit_seconds:
+                break
+            removed = [selected[index] for index in indexes]
+            remaining_selected = [item for index, item in enumerate(selected) if index not in indexes]
+            uncovered = {task_id for item in removed for task_id in item.task_id_list}
+            blocked_couriers = {item.courier_id for item in remaining_selected}
+            replacement = best_cover(uncovered, blocked_couriers, max_items=len(uncovered))
+            if not replacement:
+                continue
+            if {task_id for item in replacement for task_id in item.task_id_list} != uncovered:
+                continue
+            if selected_key(replacement) > selected_key(removed):
+                selected = remaining_selected + replacement
+                improved = True
+                break
+
+    return selected
 
 
 def branch_bound_algorithm(
@@ -318,4 +655,96 @@ def greedy_solve_competition(instance: CompetitionInstance) -> list[tuple[str, l
 
 def solve_competition_text(input_text: str) -> list[tuple[str, list[str]]]:
     instance = parse_competition_input(input_text)
-    return AutoSolverAgent().run(instance).to_submission()
+    result = AutoSolverAgent().run(instance)
+    metadata = compute_metadata(instance)
+    return assign_backup_couriers(instance.candidates, list(result.selected), metadata)
+
+
+def _expected_bundle_score(rows: list[CandidateBundle], reject_penalty: float) -> float:
+    ordered = sorted(rows, key=lambda item: (item.total_score, -item.willingness, item.courier_id))
+    fail_probability = 1.0
+    expected = 0.0
+    for row in ordered:
+        probability = max(0.0, min(1.0, row.willingness))
+        expected += fail_probability * probability * row.total_score
+        fail_probability *= 1.0 - probability
+    expected += fail_probability * reject_penalty
+    return expected
+
+
+def expected_submission_score(
+    candidates: tuple[CandidateBundle, ...],
+    result: list[tuple[str, list[str]]],
+    metadata: ProblemMetadata,
+) -> float:
+    rows = {(candidate.task_id_list_str, candidate.courier_id): candidate for candidate in candidates}
+    reject_penalty = _reject_penalty(metadata)
+    total = 0.0
+    for task_id_list_str, courier_ids in result:
+        bundle_rows = [rows[(task_id_list_str, courier_id)] for courier_id in courier_ids]
+        total += _expected_bundle_score(bundle_rows, reject_penalty)
+    return total
+
+
+def assign_backup_couriers(
+    candidates: tuple[CandidateBundle, ...],
+    selected: list[CandidateBundle],
+    metadata: ProblemMetadata,
+) -> list[tuple[str, list[str]]]:
+    if not selected:
+        return []
+
+    by_bundle: dict[str, list[CandidateBundle]] = {}
+    for candidate in candidates:
+        by_bundle.setdefault(candidate.task_id_list_str, []).append(candidate)
+    for rows in by_bundle.values():
+        rows.sort(key=lambda item: (item.total_score, -item.willingness, item.courier_id))
+
+    reject_penalty = _reject_penalty(metadata)
+    bundles = []
+    used_couriers: set[str] = set()
+    for item in selected:
+        used_couriers.add(item.courier_id)
+        bundles.append({"task_id_list_str": item.task_id_list_str, "rows": [item]})
+
+    max_couriers_per_bundle = 5 if metadata.mean_willingness < 0.18 else 4
+    while True:
+        best_choice = None
+        best_gain = 0.0
+
+        for bundle_index, bundle in enumerate(bundles):
+            rows = bundle["rows"]
+            if len(rows) >= max_couriers_per_bundle:
+                continue
+            current_score = _expected_bundle_score(rows, reject_penalty)
+            current_couriers = {row.courier_id for row in rows}
+
+            for candidate in by_bundle.get(bundle["task_id_list_str"], ())[:160]:
+                if candidate.courier_id in used_couriers or candidate.courier_id in current_couriers:
+                    continue
+                improved_score = _expected_bundle_score(rows + [candidate], reject_penalty)
+                gain = current_score - improved_score
+                if gain > best_gain:
+                    best_gain = gain
+                    best_choice = (bundle_index, candidate)
+
+        if best_choice is None or best_gain <= 1e-9:
+            break
+
+        bundle_index, candidate = best_choice
+        bundles[bundle_index]["rows"].append(candidate)
+        used_couriers.add(candidate.courier_id)
+
+    return [
+        (
+            bundle["task_id_list_str"],
+            [
+                row.courier_id
+                for row in sorted(
+                    bundle["rows"],
+                    key=lambda item: (item.total_score, -item.willingness, item.courier_id),
+                )
+            ],
+        )
+        for bundle in bundles
+    ]

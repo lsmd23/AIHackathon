@@ -38,6 +38,7 @@ def _metadata(candidates):
         "candidate_count": len(candidates),
         "task_count": len(task_ids),
         "courier_count": len(courier_ids),
+        "max_score": max(scores),
         "mean_score": sum(scores) / len(scores),
         "mean_willingness": sum(willingness) / len(willingness),
         "max_bundle_size": max_bundle_size,
@@ -80,6 +81,7 @@ def _heuristic_search(candidates, meta):
     if not candidates:
         return []
 
+    bundle_profiles = _bundle_profiles(candidates, meta)
     min_score_by_task = {}
     for item in candidates:
         task_ids, _task_list_str, _courier_id, score, _willingness = item
@@ -92,6 +94,19 @@ def _heuristic_search(candidates, meta):
 
     key_functions = [
         lambda item: (item[3] / len(item[0]), item[3], -item[4], item[1], item[2]),
+        lambda item: (
+            bundle_profiles[item[1]]["expected"] / len(item[0]),
+            bundle_profiles[item[1]]["fail_probability"],
+            item[3],
+            -item[4],
+            item[1],
+        ),
+        lambda item: (
+            bundle_profiles[item[1]]["expected"] / len(item[0]) - meta["mean_willingness"] * bundle_profiles[item[1]]["success_probability"],
+            item[3],
+            -item[4],
+            item[1],
+        ),
         lambda item: (
             item[3] / len(item[0]) - meta["mean_willingness"] * item[4],
             item[3],
@@ -107,12 +122,277 @@ def _heuristic_search(candidates, meta):
         lambda item: (-len(item[0]), item[3] / len(item[0]), -item[4], item[3]),
     ]
 
+    def evaluated_result_key(selected):
+        covered = {task for item in selected for task in item[0]}
+        expected = _expected_submission_score(candidates, _assign_backup_couriers(candidates, selected, meta), meta)
+        primary_score = sum(item[3] for item in selected)
+        return (len(covered), -expected, -primary_score)
+
     best = []
     for key in key_functions:
         selected = _greedy_by_key(candidates, key)
-        if _result_key(selected) > _result_key(best):
+        if evaluated_result_key(selected) > evaluated_result_key(best):
             best = selected
-    return best
+    for selected in _pair_first_candidates(candidates, bundle_profiles):
+        if evaluated_result_key(selected) > evaluated_result_key(best):
+            best = selected
+    for selected in _minimum_group_candidates(candidates, bundle_profiles):
+        if evaluated_result_key(selected) > evaluated_result_key(best):
+            best = selected
+    if meta["mean_willingness"] < 0.18:
+        for selected in _low_willingness_candidates(candidates, bundle_profiles):
+            if evaluated_result_key(selected) > evaluated_result_key(best):
+                best = selected
+    return _local_search(candidates, best)
+
+
+def _pair_first_candidates(candidates, bundle_profiles):
+    pair_rows = [item for item in candidates if len(item[0]) == 2]
+    single_rows = [item for item in candidates if len(item[0]) == 1]
+    single_best = {}
+    for item in sorted(single_rows, key=lambda row: (row[3] / max(row[4], 0.05), row[3], -row[4])):
+        single_best.setdefault(item[0][0], item)
+
+    sorters = [
+        lambda item: (
+            bundle_profiles[item[1]]["expected"] / 2,
+            bundle_profiles[item[1]]["fail_probability"],
+            item[3],
+            -item[4],
+        ),
+        lambda item: (
+            item[3] / 2,
+            -bundle_profiles[item[1]]["success_probability"],
+            item[3],
+            -item[4],
+        ),
+        lambda item: (
+            -bundle_profiles[item[1]]["success_probability"],
+            bundle_profiles[item[1]]["expected"] / 2,
+            item[3],
+        ),
+    ]
+
+    results = []
+    for sorter in sorters:
+        used_tasks = set()
+        used_couriers = set()
+        selected = []
+        for item in sorted(pair_rows, key=sorter):
+            if any(task in used_tasks for task in item[0]):
+                continue
+            if item[2] in used_couriers:
+                continue
+            selected.append(item)
+            used_tasks.update(item[0])
+            used_couriers.add(item[2])
+        for task_id, item in single_best.items():
+            if task_id in used_tasks or item[2] in used_couriers:
+                continue
+            selected.append(item)
+            used_tasks.add(task_id)
+            used_couriers.add(item[2])
+        results.append(selected)
+    return results
+
+
+def _low_willingness_candidates(candidates, bundle_profiles):
+    pair_rows = [item for item in candidates if len(item[0]) == 2]
+    single_rows = [item for item in candidates if len(item[0]) == 1]
+    single_best = {}
+    for item in sorted(single_rows, key=lambda row: (row[3] / max(row[4], 0.03), row[3], -row[4])):
+        single_best.setdefault(item[0][0], item)
+
+    def pair_value(item):
+        profile = bundle_profiles[item[1]]
+        return (
+            profile["fail_probability"],
+            profile["expected"] / 2,
+            item[3] / max(item[4], 0.03),
+            item[3],
+        )
+
+    results = []
+    for reverse_success in (False, True):
+        used_tasks = set()
+        used_couriers = set()
+        selected = []
+        rows = sorted(
+            pair_rows,
+            key=(
+                (lambda item: (-bundle_profiles[item[1]]["success_probability"], item[3] / max(item[4], 0.03), item[3]))
+                if reverse_success
+                else pair_value
+            ),
+        )
+        for item in rows:
+            if any(task in used_tasks for task in item[0]):
+                continue
+            if item[2] in used_couriers:
+                continue
+            selected.append(item)
+            used_tasks.update(item[0])
+            used_couriers.add(item[2])
+        for task_id, item in single_best.items():
+            if task_id in used_tasks or item[2] in used_couriers:
+                continue
+            selected.append(item)
+            used_tasks.add(task_id)
+            used_couriers.add(item[2])
+        results.append(selected)
+    return results
+
+
+def _minimum_group_candidates(candidates, bundle_profiles):
+    pair_rows = [item for item in candidates if len(item[0]) == 2]
+    single_rows = [item for item in candidates if len(item[0]) == 1]
+    single_best = {}
+    for item in sorted(single_rows, key=lambda row: (row[3], -row[4], row[2])):
+        single_best.setdefault(item[0][0], item)
+
+    sorters = [
+        lambda item: (-len(item[0]), bundle_profiles[item[1]]["expected"] / 2, item[3]),
+        lambda item: (-len(item[0]), item[3] / 2, -item[4], item[3]),
+        lambda item: (-len(item[0]), -bundle_profiles[item[1]]["success_probability"], bundle_profiles[item[1]]["expected"]),
+    ]
+    results = []
+    for sorter in sorters:
+        used_tasks = set()
+        used_couriers = set()
+        selected = []
+        for item in sorted(pair_rows, key=sorter):
+            if any(task in used_tasks for task in item[0]) or item[2] in used_couriers:
+                continue
+            selected.append(item)
+            used_tasks.update(item[0])
+            used_couriers.add(item[2])
+        for task_id, item in single_best.items():
+            if task_id in used_tasks or item[2] in used_couriers:
+                continue
+            selected.append(item)
+            used_tasks.add(task_id)
+            used_couriers.add(item[2])
+        results.append(selected)
+    return results
+
+
+def _bundle_profiles(candidates, meta, max_rows=5):
+    by_bundle = {}
+    for candidate in candidates:
+        by_bundle.setdefault(candidate[1], []).append(candidate)
+
+    reject_penalty = _reject_penalty(meta)
+    profiles = {}
+    for bundle, rows in by_bundle.items():
+        ranked = sorted(rows, key=lambda item: (item[3] / max(item[4], 0.05), item[3], -item[4], item[2]))
+        chosen = []
+        used = set()
+        for row in ranked:
+            if row[2] in used:
+                continue
+            chosen.append(row)
+            used.add(row[2])
+            if len(chosen) >= max_rows:
+                break
+        fail_probability = 1.0
+        for row in chosen:
+            fail_probability *= 1.0 - max(0.0, min(1.0, row[4]))
+        profiles[bundle] = {
+            "expected": _expected_bundle_score(chosen, reject_penalty),
+            "success_probability": 1.0 - fail_probability,
+            "fail_probability": fail_probability,
+        }
+    return profiles
+
+
+def _local_search(candidates, selected, time_limit_seconds=1.0):
+    if not candidates or not selected:
+        return selected
+
+    start = perf_counter()
+    by_task_set = {}
+    for candidate in candidates:
+        task_set = frozenset(candidate[0])
+        by_task_set.setdefault(task_set, []).append(candidate)
+    for rows in by_task_set.values():
+        rows.sort(key=lambda item: (item[3], -item[4], item[1], item[2]))
+
+    selected = list(selected)
+
+    def selected_key(items):
+        return (sum(len(item[0]) for item in items), -sum(item[3] for item in items), sum(item[4] for item in items))
+
+    def best_cover(uncovered_tasks, blocked_couriers, max_items):
+        uncovered_tasks = frozenset(uncovered_tasks)
+        pool = []
+        for task_set, rows in by_task_set.items():
+            if not task_set or not task_set.issubset(uncovered_tasks):
+                continue
+            for candidate in rows[:80]:
+                if candidate[2] not in blocked_couriers:
+                    pool.append(candidate)
+
+        pool_by_task = {}
+        for candidate in pool:
+            for task_id in candidate[0]:
+                pool_by_task.setdefault(task_id, []).append(candidate)
+
+        best = []
+
+        def dfs(remaining, used_couriers, chosen):
+            nonlocal best
+            if perf_counter() - start > time_limit_seconds:
+                return
+            if not remaining:
+                if not best or selected_key(chosen) > selected_key(best):
+                    best = list(chosen)
+                return
+            if len(chosen) >= max_items:
+                return
+
+            pivot = min(remaining, key=lambda task_id: len(pool_by_task.get(task_id, ())))
+            for candidate in pool_by_task.get(pivot, ()):
+                task_set = set(candidate[0])
+                if not task_set.issubset(remaining):
+                    continue
+                if candidate[2] in used_couriers:
+                    continue
+                chosen.append(candidate)
+                dfs(remaining - task_set, used_couriers | {candidate[2]}, chosen)
+                chosen.pop()
+
+        dfs(set(uncovered_tasks), set(), [])
+        return best
+
+    improved = True
+    while improved and perf_counter() - start <= time_limit_seconds:
+        improved = False
+        selected.sort(key=lambda item: (item[3] / len(item[0]), item[3]), reverse=True)
+        index_groups = [(index,) for index in range(len(selected))]
+        index_groups.extend(
+            (left, right)
+            for left in range(len(selected))
+            for right in range(left + 1, len(selected))
+        )
+
+        for indexes in index_groups:
+            if perf_counter() - start > time_limit_seconds:
+                break
+            removed = [selected[index] for index in indexes]
+            remaining_selected = [item for index, item in enumerate(selected) if index not in indexes]
+            uncovered = {task_id for item in removed for task_id in item[0]}
+            blocked_couriers = {item[2] for item in remaining_selected}
+            replacement = best_cover(uncovered, blocked_couriers, max_items=len(uncovered))
+            if not replacement:
+                continue
+            if {task_id for item in replacement for task_id in item[0]} != uncovered:
+                continue
+            if selected_key(replacement) > selected_key(removed):
+                selected = remaining_selected + replacement
+                improved = True
+                break
+
+    return selected
 
 
 def _branch_bound(candidates, meta, time_limit_seconds=1.5, max_candidates_per_task=24):
@@ -191,15 +471,96 @@ def _agent_run(candidates):
     meta = _metadata(candidates)
     algorithm = _agent_decide(meta)
     if algorithm == "branch_bound":
-        return _branch_bound(candidates, meta)
+        selected = _branch_bound(candidates, meta)
+        return _assign_backup_couriers(candidates, selected, meta)
     if algorithm == "heuristic_search":
-        return _heuristic_search(candidates, meta)
+        selected = _heuristic_search(candidates, meta)
+        return _assign_backup_couriers(candidates, selected, meta)
     if algorithm == "llm_direct_reasoning":
-        return _llm_direct_reasoning(candidates, meta)
-    return _greedy(candidates, meta)
+        selected = _llm_direct_reasoning(candidates, meta)
+        return _assign_backup_couriers(candidates, selected, meta)
+    selected = _greedy(candidates, meta)
+    return _assign_backup_couriers(candidates, selected, meta)
+
+
+def _expected_bundle_score(rows, reject_penalty):
+    ordered = sorted(rows, key=lambda item: (item[3], -item[4], item[2]))
+    fail_probability = 1.0
+    expected = 0.0
+    for row in ordered:
+        probability = max(0.0, min(1.0, row[4]))
+        expected += fail_probability * probability * row[3]
+        fail_probability *= 1.0 - probability
+    expected += fail_probability * reject_penalty
+    return expected
+
+
+def _expected_submission_score(candidates, result, meta):
+    rows = {(candidate[1], candidate[2]): candidate for candidate in candidates}
+    reject_penalty = _reject_penalty(meta)
+    total = 0.0
+    for task_id_list_str, courier_ids in result:
+        bundle_rows = [rows[(task_id_list_str, courier_id)] for courier_id in courier_ids]
+        total += _expected_bundle_score(bundle_rows, reject_penalty)
+    return total
+
+
+def _reject_penalty(meta):
+    return max(100.0, meta.get("max_score", 100.0) * 3.0)
+
+
+def _assign_backup_couriers(candidates, selected, meta):
+    if not selected:
+        return []
+
+    by_bundle = {}
+    for candidate in candidates:
+        by_bundle.setdefault(candidate[1], []).append(candidate)
+    for rows in by_bundle.values():
+        rows.sort(key=lambda item: (item[3], -item[4], item[2]))
+
+    reject_penalty = _reject_penalty(meta)
+    bundles = []
+    used_couriers = set()
+    for item in selected:
+        rows = [item]
+        used_couriers.add(item[2])
+        bundles.append({"task_id_list_str": item[1], "rows": rows})
+
+    max_couriers_per_bundle = 5 if meta.get("mean_willingness", 1.0) < 0.18 else 4
+    while True:
+        best_choice = None
+        best_gain = 0.0
+
+        for bundle_index, bundle in enumerate(bundles):
+            if len(bundle["rows"]) >= max_couriers_per_bundle:
+                continue
+            current_rows = bundle["rows"]
+            current_score = _expected_bundle_score(current_rows, reject_penalty)
+            current_couriers = {row[2] for row in current_rows}
+
+            for candidate in by_bundle.get(bundle["task_id_list_str"], ())[:160]:
+                if candidate[2] in used_couriers or candidate[2] in current_couriers:
+                    continue
+                improved_score = _expected_bundle_score(current_rows + [candidate], reject_penalty)
+                gain = current_score - improved_score
+                if gain > best_gain:
+                    best_gain = gain
+                    best_choice = (bundle_index, candidate)
+
+        if best_choice is None or best_gain <= 1e-9:
+            break
+
+        bundle_index, candidate = best_choice
+        bundles[bundle_index]["rows"].append(candidate)
+        used_couriers.add(candidate[2])
+
+    return [
+        (bundle["task_id_list_str"], [row[2] for row in sorted(bundle["rows"], key=lambda item: (item[3], -item[4], item[2]))])
+        for bundle in bundles
+    ]
 
 
 def solve(input_text: str) -> list:
     candidates = _parse_input(input_text)
-    selected = _agent_run(candidates)
-    return [(item[1], [item[2]]) for item in selected]
+    return _agent_run(candidates)

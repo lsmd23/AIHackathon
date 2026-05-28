@@ -44,7 +44,7 @@ python scripts\evaluate_solver.py
 | `high_noise_seed601` | 95.562 | 953.924 | 30/30 | 15 | 60 | 8325ms |
 | `large_seed301` | 307.391 | 2417.679 | 40/40 | 20 | 80 | 8323ms |
 | `large_seed302` | 340.297 | 2314.231 | 40/40 | 20 | 80 | 8328ms |
-| `low_willingness_seed501` | 1688.912 | 1628.658 | 30/30 | 30 | 70 | 5321ms |
+| `low_willingness_seed501` | 1653.277 | 1626.049 | 30/30 | 30 | 70 | 6315ms |
 | `medium_seed201` | 297.763 | 2014.797 | 30/30 | 15 | 60 | 3940ms |
 | `medium_seed202` | 286.419 | 1932.433 | 30/30 | 15 | 60 | 4197ms |
 | `medium_seed203` | 253.903 | 1733.480 | 30/30 | 15 | 60 | 4885ms |
@@ -52,7 +52,7 @@ python scripts\evaluate_solver.py
 | `small_seed100` | 187.485 | 991.797 | 15/15 | 8 | 30 | 1072ms |
 | `tiny_seed42` | 96.687 | 541.433 | 6/6 | 3 | 12 | 340ms |
 
-本地平均期望分：`448.552`。
+本地平均期望分：`445.313`。
 
 ## Agent 循环
 
@@ -80,6 +80,7 @@ python scripts\evaluate_solver.py
 - `component_dp`：按高价值合单边构造连通组件，在组件内用 bitmask DP 求任务分区。
 - `global_assigner`：从空方案出发，以边际收益为准给任务组分配不重复骑手。
 - `local_search`：在时间预算内做保守替换，保持覆盖不下降。
+- `low_assignment_finish`：低意愿场景在最终输出前比较 seeded/global 两类分配器，并做小预算骑手替换、移动和交换。
 
 ## 主要瓶颈
 
@@ -92,6 +93,8 @@ python scripts\evaluate_solver.py
 - 为低意愿单独建立更真实的代理目标，避免本地指标过度偏向生成器。
 - 探索“先保证每个任务有可接受成功率，再压低成本”的两阶段分配。
 - 控制合单使用，只保留成功率和成本同时占优的合单。
+
+当前新增的低意愿收尾优化只在 `_is_low_willingness_case` 命中时启用，避免影响普通 large/medium 的耗时。它在本地代理集上将 `low_willingness_seed501` 从 `1688.912` 降到 `1653.277`。
 
 ### `scarce_couriers_seed401`
 

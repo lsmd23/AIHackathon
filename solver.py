@@ -1050,22 +1050,18 @@ def _agent_run(candidates):
     if algorithm == "branch_bound":
         selected = _branch_bound(candidates, meta)
         policy = meta.get("_learned_policy")
-        assigner = _assign_couriers_global if policy and policy.get("_assigner") == "global" else _assign_backup_couriers
-        return assigner(candidates, selected, meta, policy)
+        return _finish_assignment(candidates, selected, meta, policy)
     if algorithm == "heuristic_search":
         selected = _heuristic_search(candidates, meta)
         policy = meta.get("_learned_policy")
-        assigner = _assign_couriers_global if policy and policy.get("_assigner") == "global" else _assign_backup_couriers
-        return assigner(candidates, selected, meta, policy)
+        return _finish_assignment(candidates, selected, meta, policy)
     if algorithm == "llm_direct_reasoning":
         selected = _llm_direct_reasoning(candidates, meta)
         policy = meta.get("_learned_policy")
-        assigner = _assign_couriers_global if policy and policy.get("_assigner") == "global" else _assign_backup_couriers
-        return assigner(candidates, selected, meta, policy)
+        return _finish_assignment(candidates, selected, meta, policy)
     selected = _greedy(candidates, meta)
     policy = meta.get("_learned_policy")
-    assigner = _assign_couriers_global if policy and policy.get("_assigner") == "global" else _assign_backup_couriers
-    return assigner(candidates, selected, meta, policy)
+    return _finish_assignment(candidates, selected, meta, policy)
 
 
 def _expected_bundle_score(rows, reject_penalty):
@@ -1160,6 +1156,30 @@ def _assign_backup_couriers(candidates, selected, meta, policy=None):
     ]
 
 
+def _finish_assignment(candidates, selected, meta, policy=None):
+    if not selected:
+        return []
+
+    preferred_assigner = _assign_couriers_global if policy and policy.get("_assigner") == "global" else _assign_backup_couriers
+    trial_assigners = [preferred_assigner]
+    if _is_low_willingness_case(candidates, meta):
+        other = _assign_backup_couriers if preferred_assigner is _assign_couriers_global else _assign_couriers_global
+        trial_assigners.append(other)
+
+    best_result = []
+    best_key = (-1, float("-inf"), float("-inf"))
+    for assigner in trial_assigners:
+        trial_policy = dict(policy or {})
+        trial_policy["_assigner"] = "global" if assigner is _assign_couriers_global else "seeded"
+        result = assigner(candidates, selected, meta, trial_policy)
+        result = _polish_assignment(candidates, result, meta, trial_policy)
+        key = _policy_score(candidates, result, meta, trial_policy)
+        if key > best_key:
+            best_key = key
+            best_result = result
+    return best_result
+
+
 def _assign_couriers_global(candidates, selected, meta, policy=None):
     if not selected:
         return []
@@ -1226,6 +1246,167 @@ def _assign_couriers_global(candidates, selected, meta, policy=None):
                 bundle["rows"].append(candidate)
                 used_couriers.add(candidate[2])
                 break
+
+    return [
+        (bundle["task_id_list_str"], [row[2] for row in sorted(bundle["rows"], key=lambda item: (item[3], -item[4], item[2]))])
+        for bundle in bundles
+        if bundle["rows"]
+    ]
+
+
+def _polish_assignment(candidates, result, meta, policy=None):
+    if not result:
+        return result
+
+    is_low = _is_low_willingness_case(candidates, meta)
+    if not is_low:
+        return result
+
+    time_limit = 0.8
+    start = perf_counter()
+    rows_by_key = {(candidate[1], candidate[2]): candidate for candidate in candidates}
+    reject_penalty = _reject_penalty(meta)
+    max_couriers_per_bundle = _policy_max_couriers(meta, policy)
+
+    bundles = []
+    for task_id_list_str, courier_ids in result:
+        rows = [rows_by_key[(task_id_list_str, courier_id)] for courier_id in courier_ids if (task_id_list_str, courier_id) in rows_by_key]
+        if rows:
+            bundles.append({"task_id_list_str": task_id_list_str, "rows": rows})
+    if len(bundles) < 2:
+        return result
+
+    def objective(rows, task_id_list_str):
+        if rows:
+            expected = _expected_bundle_score(rows, reject_penalty)
+            assigned = sum(row[3] for row in rows)
+        else:
+            expected = reject_penalty * len([task for task in task_id_list_str.split(",") if task])
+            assigned = 0.0
+        return _raw_objective_from_score(expected, assigned, candidates, meta, policy)
+
+    bundle_objectives = [objective(bundle["rows"], bundle["task_id_list_str"]) for bundle in bundles]
+
+    by_bundle = {}
+    for candidate in candidates:
+        by_bundle.setdefault(candidate[1], []).append(candidate)
+    for rows in by_bundle.values():
+        rows.sort(key=lambda item: (item[3] / max(item[4], 0.03), item[3], -item[4], item[2]))
+
+    while perf_counter() - start <= time_limit:
+        best = None
+        best_gain = 1e-9
+        used_couriers = {row[2] for bundle in bundles for row in bundle["rows"]}
+
+        for bundle_index, bundle in enumerate(bundles):
+            bundle_key = bundle["task_id_list_str"]
+            current_score = bundle_objectives[bundle_index]
+            for row_index, old_row in enumerate(bundle["rows"]):
+                for candidate in by_bundle.get(bundle_key, ())[:120]:
+                    if candidate[2] != old_row[2] and candidate[2] in used_couriers:
+                        continue
+                    if candidate[2] in {row[2] for idx, row in enumerate(bundle["rows"]) if idx != row_index}:
+                        continue
+                    if candidate == old_row:
+                        continue
+                    replacement_rows = list(bundle["rows"])
+                    replacement_rows[row_index] = candidate
+                    gain = current_score - objective(replacement_rows, bundle_key)
+                    if gain > best_gain:
+                        best_gain = gain
+                        best = ("replace", bundle_index, row_index, candidate)
+
+        for source_index, source in enumerate(bundles):
+            if len(source["rows"]) <= 1:
+                continue
+            source_key = source["task_id_list_str"]
+            source_score = bundle_objectives[source_index]
+            for row_index, source_row in enumerate(source["rows"]):
+                courier_id = source_row[2]
+                source_after = source["rows"][:row_index] + source["rows"][row_index + 1 :]
+                source_after_score = objective(source_after, source_key)
+
+                for target_index, target in enumerate(bundles):
+                    if target_index == source_index or len(target["rows"]) >= max_couriers_per_bundle:
+                        continue
+                    target_key = target["task_id_list_str"]
+                    moved = rows_by_key.get((target_key, courier_id))
+                    if moved is None:
+                        continue
+                    target_score = bundle_objectives[target_index]
+                    target_after = target["rows"] + [moved]
+                    gain = source_score + target_score - source_after_score - objective(target_after, target_key)
+                    if gain > best_gain:
+                        best_gain = gain
+                        best = ("move", source_index, row_index, target_index, moved, source_after_score)
+
+        assignment_refs = [
+            (bundle_index, row_index, row)
+            for bundle_index, bundle in enumerate(bundles)
+            for row_index, row in enumerate(bundle["rows"])
+        ]
+        for left_pos, (left_bundle_index, left_row_index, left_row) in enumerate(assignment_refs):
+            left_bundle = bundles[left_bundle_index]
+            left_key = left_bundle["task_id_list_str"]
+            left_score = bundle_objectives[left_bundle_index]
+            for right_bundle_index, right_row_index, right_row in assignment_refs[left_pos + 1 :]:
+                if right_bundle_index == left_bundle_index:
+                    continue
+                right_bundle = bundles[right_bundle_index]
+                right_key = right_bundle["task_id_list_str"]
+                left_replacement = rows_by_key.get((left_key, right_row[2]))
+                right_replacement = rows_by_key.get((right_key, left_row[2]))
+                if left_replacement is None or right_replacement is None:
+                    continue
+                if right_row[2] in {row[2] for idx, row in enumerate(left_bundle["rows"]) if idx != left_row_index}:
+                    continue
+                if left_row[2] in {row[2] for idx, row in enumerate(right_bundle["rows"]) if idx != right_row_index}:
+                    continue
+                left_after = list(left_bundle["rows"])
+                right_after = list(right_bundle["rows"])
+                left_after[left_row_index] = left_replacement
+                right_after[right_row_index] = right_replacement
+                gain = (
+                    left_score
+                    + bundle_objectives[right_bundle_index]
+                    - objective(left_after, left_key)
+                    - objective(right_after, right_key)
+                )
+                if gain > best_gain:
+                    best_gain = gain
+                    best = ("swap", left_bundle_index, left_row_index, left_replacement, right_bundle_index, right_row_index, right_replacement)
+
+        if best is None:
+            break
+
+        if best[0] == "replace":
+            _kind, bundle_index, row_index, candidate = best
+            bundles[bundle_index]["rows"][row_index] = candidate
+            bundle_objectives[bundle_index] = objective(bundles[bundle_index]["rows"], bundles[bundle_index]["task_id_list_str"])
+        elif best[0] == "move":
+            _kind, source_index, row_index, target_index, moved, source_after_score = best
+            bundles[source_index]["rows"].pop(row_index)
+            bundles[target_index]["rows"].append(moved)
+            bundle_objectives[source_index] = source_after_score
+            bundle_objectives[target_index] = objective(bundles[target_index]["rows"], bundles[target_index]["task_id_list_str"])
+        else:
+            (
+                _kind,
+                left_bundle_index,
+                left_row_index,
+                left_replacement,
+                right_bundle_index,
+                right_row_index,
+                right_replacement,
+            ) = best
+            bundles[left_bundle_index]["rows"][left_row_index] = left_replacement
+            bundles[right_bundle_index]["rows"][right_row_index] = right_replacement
+            bundle_objectives[left_bundle_index] = objective(
+                bundles[left_bundle_index]["rows"], bundles[left_bundle_index]["task_id_list_str"]
+            )
+            bundle_objectives[right_bundle_index] = objective(
+                bundles[right_bundle_index]["rows"], bundles[right_bundle_index]["task_id_list_str"]
+            )
 
     return [
         (bundle["task_id_list_str"], [row[2] for row in sorted(bundle["rows"], key=lambda item: (item[3], -item[4], item[2]))])

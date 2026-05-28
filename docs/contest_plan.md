@@ -87,7 +87,14 @@ def solve(input_text: str) -> list:
 
 ## 当前 baseline 评测
 
-本轮 baseline 已完成官方评测 `10/10`，所有样例任务覆盖率均为 `100%`，平均惩罚分数为 `2102.16`。
+当前 baseline 已完成官方评测 `10/10`，所有样例任务覆盖率均为 `100%`，平均惩罚分数为 `771.89`。
+
+本轮有效优化不再是单纯的贪心排序，而是一个多策略 Agent：
+
+- 先生成多个任务分区候选，包括合单优先、低意愿拆单、组件分治 DP。
+- 再对每个分区运行多骑手备选分配。
+- 通过期望惩罚分和 assigned 成本做代理自评估。
+- 对低意愿和骑手稀缺样例开启更强的专科策略。
 
 详情见 [baseline_evaluation.md](baseline_evaluation.md)。
 
@@ -96,9 +103,10 @@ def solve(input_text: str) -> list:
 ### 成员 A：算法负责人
 
 - 设计目标函数和评估指标。
-- 实现平均成本贪心、局部搜索、bitmask/beam search。
+- 维护平均成本贪心、组件 DP、局部搜索、bitmask/beam search。
 - 对大样例做误差分析，比较覆盖任务数、总分和耗时。
 - 维护候选冲突索引和搜索剪枝逻辑。
+- 重点跟进 `low_willingness` 与 `scarce_couriers` 两类 case 的专科策略。
 
 ### 成员 B：工程与提交负责人
 
@@ -106,6 +114,7 @@ def solve(input_text: str) -> list:
 - 完成 TSV 解析、结果校验、测试和本地运行脚本。
 - 建立实验记录格式，保存每种策略的分数和耗时。
 - 负责最终代码压缩、提交验证和回归测试。
+- 维护 `examples/blackbox_like` 和 `scripts/evaluate_solver.py`，避免本地代理指标与线上黑箱脱节。
 
 ## 里程碑
 
@@ -127,6 +136,7 @@ def solve(input_text: str) -> list:
 - 引入 bitmask 表示任务集合。
 - 增强分支定界、局部搜索或 beam search。
 - 在 10 秒限制内稳定优于 baseline。
+- 引入组件分治 DP 和全局骑手分配器。
 
 ### M4：最终提交
 

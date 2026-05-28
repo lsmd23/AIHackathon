@@ -67,15 +67,15 @@ python -c "from pathlib import Path; import solver; print(len(solver.solve(Path(
 
 ## Current Baseline
 
-The baseline implements a lightweight deterministic Agent:
+The current baseline implements a deterministic multi-strategy Agent:
 
 1. Parse candidate rows from TSV.
 2. Compute metadata such as task count, courier count, score statistics, and bundle size.
-3. Run several heuristic task-partition strategies.
-4. For each strategy, assign multiple backup couriers per selected task bundle.
-5. Evaluate expected score and keep the best complete plan.
+3. Generate task partitions with greedy rules, low-willingness split rules, and component-level bitmask DP.
+4. For each partition, compare seeded backup assignment with global marginal-gain courier assignment.
+5. Evaluate expected score and assigned-cost proxy, then keep the best complete plan.
 
-This baseline has passed the current public evaluation set: `10/10` cases, all with `100%` task coverage. See [baseline_evaluation.md](docs/baseline_evaluation.md).
+This baseline has passed the current public evaluation set: `10/10` cases, all with `100%` task coverage and an average penalty score of `771.89`. See [baseline_evaluation.md](docs/baseline_evaluation.md).
 
 ## Local Cases
 

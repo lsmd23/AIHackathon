@@ -29,7 +29,7 @@ def parse_rows(input_text: str):
 
 def expected_score(input_text: str, result: list) -> float:
     rows, scores, _tasks = parse_rows(input_text)
-    reject_penalty = max(100.0, max(scores, default=100.0) * 3.0)
+    reject_penalty_per_task = 100.0
     total = 0.0
     for task_id_list_str, courier_ids in result:
         fail_probability = 1.0
@@ -37,13 +37,19 @@ def expected_score(input_text: str, result: list) -> float:
             score, willingness = rows[(task_id_list_str, courier_id)]
             total += fail_probability * willingness * score
             fail_probability *= 1.0 - willingness
-        total += fail_probability * reject_penalty
+        task_count = len([task for task in task_id_list_str.split(",") if task.strip()])
+        total += fail_probability * reject_penalty_per_task * task_count
     return total
+
+
+def assigned_score(input_text: str, result: list) -> float:
+    rows, _scores, _tasks = parse_rows(input_text)
+    return sum(rows[(task_id_list_str, courier_id)][0] for task_id_list_str, courier_ids in result for courier_id in courier_ids)
 
 
 def main() -> None:
     total_expected = 0.0
-    print("case,expected,covered,total_tasks,groups,couriers,runtime_ms")
+    print("case,expected,assigned,covered,total_tasks,groups,couriers,runtime_ms")
     for case_path in CASE_PATHS:
         input_text = case_path.read_text(encoding="utf-8")
         _rows, _scores, all_tasks = parse_rows(input_text)
@@ -53,12 +59,13 @@ def main() -> None:
         covered = {task.strip() for task_id_list_str, _couriers in result for task in task_id_list_str.split(",")}
         couriers = {courier_id for _task_id_list_str, courier_ids in result for courier_id in courier_ids}
         score = expected_score(input_text, result)
+        assigned = assigned_score(input_text, result)
         total_expected += score
         print(
-            f"{case_path.stem},{score:.3f},{len(covered)},{len(all_tasks)},"
+            f"{case_path.stem},{score:.3f},{assigned:.3f},{len(covered)},{len(all_tasks)},"
             f"{len(result)},{len(couriers)},{runtime_ms:.1f}"
         )
-    print(f"average,{total_expected / len(CASE_PATHS):.3f},,,,,")
+    print(f"average,{total_expected / len(CASE_PATHS):.3f},,,,,,")
 
 
 if __name__ == "__main__":

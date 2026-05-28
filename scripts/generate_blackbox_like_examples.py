@@ -20,7 +20,16 @@ CASE_CONFIGS = {
         willingness_scale=1.0,
         bundle_discount=0.68,
     ),
-    "low_willingness_seed501": dict(task_count=30, courier_count=70, seed=501, noise=0.8, willingness_scale=0.28),
+    "low_willingness_seed501": dict(
+        task_count=30,
+        courier_count=70,
+        seed=501,
+        noise=0.8,
+        willingness_scale=0.34,
+        pair_willingness_scale=0.55,
+        single_willingness_scale=1.35,
+        bundle_discount=0.82,
+    ),
     "high_noise_seed601": dict(task_count=30, courier_count=70, seed=601, noise=2.3, willingness_scale=1.0),
 }
 
@@ -33,6 +42,8 @@ def make_case(
     noise: float = 1.0,
     willingness_scale: float = 1.0,
     bundle_discount: float = 0.72,
+    pair_willingness_scale: float = 1.0,
+    single_willingness_scale: float = 1.0,
 ) -> str:
     rng = random.Random(seed)
     lines = ["task_id_list\tcourier_id\ttotal_score\twillingness"]
@@ -40,7 +51,8 @@ def make_case(
     def willingness(task_a: int, courier: int, task_b: int | None = None) -> float:
         base = 0.08 + ((task_a * 13 + courier * 17 + (task_b or 0) * 7) % 78) / 100.0
         jitter = rng.uniform(-0.04, 0.04)
-        return max(0.01, min(0.95, (base + jitter) * willingness_scale))
+        shape_scale = pair_willingness_scale if task_b is not None else single_willingness_scale
+        return max(0.01, min(0.95, (base + jitter) * willingness_scale * shape_scale))
 
     def score(task_a: int, courier: int, task_b: int | None = None) -> float:
         distance = abs((task_a * 11 + (task_b or task_a) * 5) % 97 - (courier * 9) % 97)

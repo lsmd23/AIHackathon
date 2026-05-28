@@ -42,6 +42,8 @@ class ProblemMetadata:
     mean_willingness: float
     max_willingness: float
     max_bundle_size: int
+    top5_willingness: float = 1.0
+    cheap5_willingness: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -95,6 +97,7 @@ def compute_metadata(instance: CompetitionInstance) -> ProblemMetadata:
     if not scores:
         return ProblemMetadata(0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0)
 
+    pressure = willingness_pressure(instance.candidates)
     return ProblemMetadata(
         candidate_count=len(instance.candidates),
         task_count=len(instance.task_ids),
@@ -106,7 +109,48 @@ def compute_metadata(instance: CompetitionInstance) -> ProblemMetadata:
         mean_willingness=sum(willingness) / len(willingness),
         max_willingness=max(willingness),
         max_bundle_size=max(item.task_count for item in instance.candidates),
+        top5_willingness=pressure["top5_mean"],
+        cheap5_willingness=pressure["cheap5_mean"],
     )
+
+
+def willingness_pressure(candidates: tuple[CandidateBundle, ...]) -> dict[str, float]:
+    by_bundle: dict[str, list[CandidateBundle]] = {}
+    for candidate in candidates:
+        by_bundle.setdefault(candidate.task_id_list_str, []).append(candidate)
+    if not by_bundle:
+        return {"top5_mean": 1.0, "cheap5_mean": 1.0}
+
+    top_values: list[float] = []
+    cheap_values: list[float] = []
+    for rows in by_bundle.values():
+        top = sorted((row.willingness for row in rows), reverse=True)[:5]
+        cheap = sorted(rows, key=lambda row: (row.total_score, -row.willingness))[:5]
+        top_values.append(sum(top) / len(top))
+        cheap_values.append(sum(row.willingness for row in cheap) / len(cheap))
+    return {
+        "top5_mean": sum(top_values) / len(top_values),
+        "cheap5_mean": sum(cheap_values) / len(cheap_values),
+    }
+
+
+def is_low_willingness_case(
+    candidates: tuple[CandidateBundle, ...],
+    metadata: ProblemMetadata,
+) -> bool:
+    return (
+        metadata.mean_willingness < 0.18
+        or metadata.top5_willingness < 0.45
+        or metadata.cheap5_willingness < 0.22
+    )
+
+
+def robust_alpha(candidates: tuple[CandidateBundle, ...], metadata: ProblemMetadata) -> float:
+    if is_low_willingness_case(candidates, metadata):
+        return 0.65
+    if metadata.courier_count / max(metadata.task_count, 1) < 1.25:
+        return 1.2
+    return 0.85
 
 
 def result_key(selected: tuple[CandidateBundle, ...]) -> tuple[int, float, float]:
@@ -160,6 +204,7 @@ def heuristic_search_algorithm(instance: CompetitionInstance, metadata: ProblemM
         return SolverResult((), "heuristic_search")
 
     bundle_profiles = _bundle_profiles(instance.candidates, metadata)
+    low_case = is_low_willingness_case(instance.candidates, metadata)
     min_score_by_task: dict[str, float] = {}
     for candidate in instance.candidates:
         for task_id in candidate.task_id_list:
@@ -217,6 +262,16 @@ def heuristic_search_algorithm(instance: CompetitionInstance, metadata: ProblemM
         submission = assign_backup_couriers(instance.candidates, list(selected), metadata)
         expected = expected_submission_score(instance.candidates, submission, metadata)
         primary_score = sum(item.total_score for item in selected)
+        is_scarce = metadata.courier_count / max(metadata.task_count, 1) < 1.25
+        is_low_willingness = low_case
+        if is_scarce or is_low_willingness:
+            row_map = {(candidate.task_id_list_str, candidate.courier_id): candidate for candidate in instance.candidates}
+            assigned_score = sum(
+                row_map[(task_id_list_str, courier_id)].total_score
+                for task_id_list_str, courier_ids in submission
+                for courier_id in courier_ids
+            )
+            expected = max(expected, assigned_score * robust_alpha(instance.candidates, metadata))
         return (len(covered), -expected, -primary_score)
 
     best = SolverResult((), "heuristic_search")
@@ -232,16 +287,25 @@ def heuristic_search_algorithm(instance: CompetitionInstance, metadata: ProblemM
         selected_tuple = tuple(selected)
         if evaluated_result_key(selected_tuple) > evaluated_result_key(best.selected):
             best = SolverResult(selected_tuple, "heuristic_search")
-    if metadata.mean_willingness < 0.18:
+    for selected in budgeted_pairing_candidates(instance.candidates, metadata):
+        selected_tuple = tuple(selected)
+        if evaluated_result_key(selected_tuple) > evaluated_result_key(best.selected):
+            best = SolverResult(selected_tuple, "heuristic_search")
+    if low_case:
         for selected in low_willingness_candidates(instance.candidates, bundle_profiles):
             selected_tuple = tuple(selected)
             if evaluated_result_key(selected_tuple) > evaluated_result_key(best.selected):
                 best = SolverResult(selected_tuple, "heuristic_search")
+        for selected in hybrid_split_candidates(instance.candidates, metadata):
+            selected_tuple = tuple(selected)
+            if evaluated_result_key(selected_tuple) > evaluated_result_key(best.selected):
+                best = SolverResult(selected_tuple, "heuristic_search")
 
-    return SolverResult(
-        tuple(local_search_improve(instance.candidates, list(best.selected))),
-        "heuristic_search",
-    )
+    local_budget = 0.25 if metadata.candidate_count > 30000 else 0.7
+    improved = tuple(local_search_improve(instance.candidates, list(best.selected), time_limit_seconds=local_budget))
+    if evaluated_result_key(improved) > evaluated_result_key(best.selected):
+        return SolverResult(improved, "heuristic_search")
+    return best
 
 
 def pair_first_candidates(
@@ -359,6 +423,285 @@ def low_willingness_candidates(
     return results
 
 
+def hybrid_split_candidates(
+    candidates: tuple[CandidateBundle, ...],
+    metadata: ProblemMetadata,
+) -> list[list[CandidateBundle]]:
+    single_rows = [item for item in candidates if item.task_count == 1]
+    pair_rows = [item for item in candidates if item.task_count == 2]
+    if not single_rows or not pair_rows:
+        return []
+
+    by_bundle: dict[str, list[CandidateBundle]] = {}
+    for candidate in candidates:
+        by_bundle.setdefault(candidate.task_id_list_str, []).append(candidate)
+    for rows in by_bundle.values():
+        rows.sort(
+            key=lambda item: (
+                item.total_score / max(item.willingness, 0.03),
+                item.total_score,
+                -item.willingness,
+                item.courier_id,
+            )
+        )
+
+    reject_penalty = _reject_penalty(metadata)
+
+    def preview_cost(rows: list[CandidateBundle], limit: int = 4, alpha: float = 0.85) -> float:
+        preview = rows[:limit]
+        expected = _expected_bundle_score(preview, reject_penalty)
+        assigned = sum(row.total_score for row in preview)
+        return max(expected, assigned * alpha)
+
+    single_info: dict[str, dict] = {}
+    for item in single_rows:
+        task_id = item.task_id_list[0]
+        if task_id in single_info:
+            continue
+        rows = by_bundle[item.task_id_list_str]
+        single_info[task_id] = {
+            "rows": rows,
+            "cost": preview_cost(rows),
+        }
+
+    pair_infos = []
+    seen: set[frozenset[str]] = set()
+    for item in pair_rows:
+        tasks = frozenset(item.task_id_list)
+        if tasks in seen:
+            continue
+        seen.add(tasks)
+        left, right = item.task_id_list
+        if left not in single_info or right not in single_info:
+            continue
+        rows = by_bundle[item.task_id_list_str]
+        pair_cost = preview_cost(rows)
+        split_cost = single_info[left]["cost"] + single_info[right]["cost"]
+        pair_infos.append(
+            {
+                "tasks": tasks,
+                "rows": rows,
+                "saving": split_cost - pair_cost,
+                "cost": pair_cost,
+            }
+        )
+
+    def build(min_saving: float) -> list[CandidateBundle]:
+        used_tasks: set[str] = set()
+        used_couriers: set[str] = set()
+        selected: list[CandidateBundle] = []
+        for info in sorted(pair_infos, key=lambda row: (-row["saving"], row["cost"])):
+            if info["saving"] < min_saving:
+                continue
+            if info["tasks"] & used_tasks:
+                continue
+            row = next((candidate for candidate in info["rows"][:80] if candidate.courier_id not in used_couriers), None)
+            if row is None:
+                continue
+            selected.append(row)
+            used_tasks.update(info["tasks"])
+            used_couriers.add(row.courier_id)
+
+        for task_id, info in sorted(single_info.items(), key=lambda item: item[1]["cost"]):
+            if task_id in used_tasks:
+                continue
+            row = next((candidate for candidate in info["rows"][:80] if candidate.courier_id not in used_couriers), None)
+            if row is None:
+                continue
+            selected.append(row)
+            used_tasks.add(task_id)
+            used_couriers.add(row.courier_id)
+        return selected
+
+    thresholds = (-50.0, 0.0, 25.0, 50.0, 100.0)
+    return [build(threshold) for threshold in thresholds]
+
+
+def low_beam_candidates(
+    candidates: tuple[CandidateBundle, ...],
+    metadata: ProblemMetadata,
+) -> list[list[CandidateBundle]]:
+    single_rows = [item for item in candidates if item.task_count == 1]
+    pair_rows = [item for item in candidates if item.task_count == 2]
+    if not single_rows or not pair_rows:
+        return []
+
+    by_bundle: dict[str, list[CandidateBundle]] = {}
+    for candidate in candidates:
+        by_bundle.setdefault(candidate.task_id_list_str, []).append(candidate)
+    for rows in by_bundle.values():
+        rows.sort(
+            key=lambda item: (
+                item.total_score / max(item.willingness, 0.03),
+                item.total_score,
+                -item.willingness,
+                item.courier_id,
+            )
+        )
+
+    reject_penalty = _reject_penalty(metadata)
+    alpha = robust_alpha(candidates, metadata)
+    all_tasks = sorted({task for item in candidates for task in item.task_id_list})
+    full_task_count = len(all_tasks)
+    choices_by_task: dict[str, list[tuple[frozenset[str], list[CandidateBundle], float]]] = {task: [] for task in all_tasks}
+    seen_groups: set[frozenset[str]] = set()
+
+    for item in single_rows + pair_rows:
+        task_set = frozenset(item.task_id_list)
+        if task_set in seen_groups:
+            continue
+        seen_groups.add(task_set)
+        rows = by_bundle[item.task_id_list_str]
+        preview = rows[:4]
+        expected = _expected_bundle_score(preview, reject_penalty)
+        assigned = sum(row.total_score for row in preview)
+        cost = max(expected, assigned * alpha)
+        choice = (task_set, rows, cost)
+        for task in task_set:
+            choices_by_task[task].append(choice)
+
+    for choices in choices_by_task.values():
+        choices.sort(key=lambda choice: (choice[2] / len(choice[0]), choice[2]))
+
+    results: list[list[CandidateBundle]] = []
+    for pair_bonus in (-100.0, 0.0, 25.0):
+        states = [(0.0, frozenset(), frozenset(), [])]
+        for _ in range(full_task_count):
+            next_states = []
+            for cost, covered, used_couriers, selected in states:
+                if len(covered) == full_task_count:
+                    next_states.append((cost, covered, used_couriers, selected))
+                    continue
+                pivot = next(task for task in all_tasks if task not in covered)
+                for task_set, rows, group_cost in choices_by_task[pivot][:45]:
+                    if task_set & covered:
+                        continue
+                    row = next((candidate for candidate in rows[:50] if candidate.courier_id not in used_couriers), None)
+                    if row is None:
+                        continue
+                    bonus = pair_bonus if len(task_set) == 2 else 0.0
+                    next_states.append(
+                        (
+                            cost + group_cost - bonus,
+                            covered | task_set,
+                            used_couriers | {row.courier_id},
+                            selected + [row],
+                        )
+                    )
+            states = sorted(next_states, key=lambda state: (state[0], len(state[3])))[:260]
+            if states and all(len(state[1]) == full_task_count for state in states):
+                break
+        results.extend(state[3] for state in states[:2] if len(state[1]) == full_task_count)
+    return results
+
+
+def budgeted_pairing_candidates(
+    candidates: tuple[CandidateBundle, ...],
+    metadata: ProblemMetadata,
+) -> list[list[CandidateBundle]]:
+    pair_rows = [item for item in candidates if item.task_count == 2]
+    single_rows = [item for item in candidates if item.task_count == 1]
+    if not pair_rows:
+        return []
+
+    by_bundle: dict[str, list[CandidateBundle]] = {}
+    for candidate in candidates:
+        by_bundle.setdefault(candidate.task_id_list_str, []).append(candidate)
+    for rows in by_bundle.values():
+        rows.sort(
+            key=lambda item: (
+                item.total_score / max(item.willingness, 0.03),
+                item.total_score,
+                -item.willingness,
+                item.courier_id,
+            )
+        )
+
+    reject_penalty = _reject_penalty(metadata)
+    low_case = is_low_willingness_case(candidates, metadata)
+    budget = 4 if low_case else 2
+    if metadata.courier_count / max(metadata.task_count, 1) < 1.25:
+        budget = 2
+
+    pair_infos = []
+    seen_pairs: set[frozenset[str]] = set()
+    for item in pair_rows:
+        task_pair = frozenset(item.task_id_list)
+        if task_pair in seen_pairs:
+            continue
+        seen_pairs.add(task_pair)
+        rows = by_bundle[item.task_id_list_str]
+        preview = rows[:budget]
+        fail_probability = 1.0
+        for row in preview:
+            fail_probability *= 1.0 - max(0.0, min(1.0, row.willingness))
+        pair_infos.append(
+            {
+                "tasks": task_pair,
+                "bundle": item.task_id_list_str,
+                "rows": rows,
+                "primary": rows[0],
+                "expected": _expected_bundle_score(preview, reject_penalty),
+                "fail": fail_probability,
+                "success": 1.0 - fail_probability,
+            }
+        )
+
+    single_best: dict[str, CandidateBundle] = {}
+    for item in sorted(
+        single_rows,
+        key=lambda row: (row.total_score / max(row.willingness, 0.03), row.total_score, -row.willingness, row.courier_id),
+    ):
+        single_best.setdefault(item.task_id_list[0], item)
+
+    def build(sorter) -> list[CandidateBundle]:
+        used_tasks: set[str] = set()
+        used_couriers: set[str] = set()
+        selected: list[CandidateBundle] = []
+        for info in sorted(pair_infos, key=sorter):
+            if info["tasks"] & used_tasks:
+                continue
+            chosen = None
+            for row in info["rows"][:80]:
+                if row.courier_id not in used_couriers:
+                    chosen = row
+                    break
+            if chosen is None:
+                continue
+            selected.append(chosen)
+            used_tasks.update(info["tasks"])
+            used_couriers.add(chosen.courier_id)
+
+        for task_id, item in single_best.items():
+            if task_id in used_tasks:
+                continue
+            chosen = item
+            if chosen.courier_id in used_couriers:
+                for row in by_bundle.get(chosen.task_id_list_str, ())[:80]:
+                    if row.courier_id not in used_couriers:
+                        chosen = row
+                        break
+                else:
+                    continue
+            selected.append(chosen)
+            used_tasks.add(task_id)
+            used_couriers.add(chosen.courier_id)
+        return selected
+
+    sorters = [
+        lambda info: (info["expected"] / 2, info["fail"], info["primary"].total_score, -info["primary"].willingness),
+        lambda info: (
+            info["fail"],
+            info["expected"] / 2,
+            info["primary"].total_score / max(info["primary"].willingness, 0.03),
+        ),
+        lambda info: (-info["success"], info["expected"] / 2, info["primary"].total_score),
+        lambda info: (info["primary"].total_score / max(info["primary"].willingness, 0.03), info["expected"] / 2),
+        lambda info: (info["primary"].total_score, -info["primary"].willingness, info["expected"] / 2),
+    ]
+    return [build(sorter) for sorter in sorters]
+
+
 def minimum_group_candidates(
     candidates: tuple[CandidateBundle, ...],
     bundle_profiles: dict[str, dict[str, float]],
@@ -400,7 +743,7 @@ def minimum_group_candidates(
 
 
 def _reject_penalty(metadata: ProblemMetadata) -> float:
-    return max(100.0, metadata.max_score * 3.0)
+    return 100.0
 
 
 def _bundle_profiles(
@@ -462,6 +805,7 @@ def local_search_improve(
     def selected_key(items: list[CandidateBundle]) -> tuple[int, float, float]:
         return (
             sum(item.task_count for item in items),
+            -len(items),
             -sum(item.total_score for item in items),
             sum(item.willingness for item in items),
         )
@@ -661,6 +1005,8 @@ def solve_competition_text(input_text: str) -> list[tuple[str, list[str]]]:
 
 
 def _expected_bundle_score(rows: list[CandidateBundle], reject_penalty: float) -> float:
+    if not rows:
+        return 0.0
     ordered = sorted(rows, key=lambda item: (item.total_score, -item.willingness, item.courier_id))
     fail_probability = 1.0
     expected = 0.0
@@ -668,7 +1014,7 @@ def _expected_bundle_score(rows: list[CandidateBundle], reject_penalty: float) -
         probability = max(0.0, min(1.0, row.willingness))
         expected += fail_probability * probability * row.total_score
         fail_probability *= 1.0 - probability
-    expected += fail_probability * reject_penalty
+    expected += fail_probability * reject_penalty * ordered[0].task_count
     return expected
 
 
@@ -707,7 +1053,14 @@ def assign_backup_couriers(
         used_couriers.add(item.courier_id)
         bundles.append({"task_id_list_str": item.task_id_list_str, "rows": [item]})
 
-    max_couriers_per_bundle = 5 if metadata.mean_willingness < 0.18 else 4
+    if metadata.courier_count / max(metadata.task_count, 1) < 1.25:
+        max_couriers_per_bundle = 2
+    else:
+        max_couriers_per_bundle = 4
+    use_robust_gain = (
+        metadata.courier_count / max(metadata.task_count, 1) < 1.25
+        or is_low_willingness_case(candidates, metadata)
+    )
     while True:
         best_choice = None
         best_gain = 0.0
@@ -723,7 +1076,15 @@ def assign_backup_couriers(
                 if candidate.courier_id in used_couriers or candidate.courier_id in current_couriers:
                     continue
                 improved_score = _expected_bundle_score(rows + [candidate], reject_penalty)
-                gain = current_score - improved_score
+                if use_robust_gain:
+                    current_assigned = sum(row.total_score for row in rows)
+                    improved_assigned = current_assigned + candidate.total_score
+                    alpha = robust_alpha(candidates, metadata)
+                    current_objective = max(current_score, current_assigned * alpha)
+                    improved_objective = max(improved_score, improved_assigned * alpha)
+                    gain = current_objective - improved_objective
+                else:
+                    gain = current_score - improved_score
                 if gain > best_gain:
                     best_gain = gain
                     best_choice = (bundle_index, candidate)

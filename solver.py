@@ -302,7 +302,9 @@ def _heuristic_search(candidates, meta):
         if scarce_case and meta.get("task_count", 0) <= 44 and meta.get("max_bundle_size", 0) <= 2:
             for selected in _scarce_pair_matching_candidates(candidates, meta):
                 experiments.append(selected)
-        if meta.get("task_count", 0) <= 30 and meta.get("score_spread", 0.0) > 0.84:
+        if meta.get("task_count", 0) <= 8 or (
+            meta.get("task_count", 0) <= 30 and meta.get("score_spread", 0.0) > 0.84
+        ):
             for selected in _component_dp_candidates(candidates, meta):
                 experiments.append(selected)
         if meta.get("score_spread", 0.0) > 1.0:
@@ -1893,10 +1895,11 @@ def _polish_assignment(candidates, result, meta, policy=None):
         return result
 
     is_low = _is_low_willingness_case(candidates, meta)
-    if not is_low:
+    small_polish_case = 10 <= meta.get("task_count", 0) <= 18 and meta.get("candidate_count", 0) <= 5000
+    if not is_low and not small_polish_case:
         return result
 
-    time_limit = 0.8
+    time_limit = 0.25 if small_polish_case and not is_low else 0.8
     start = perf_counter()
     rows_by_key = {(candidate[1], candidate[2]): candidate for candidate in candidates}
     reject_penalty = _reject_penalty(meta)

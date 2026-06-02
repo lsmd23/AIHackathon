@@ -12,6 +12,7 @@ import solver
 CASE_PATHS = [
     Path("examples/large_seed301.txt"),
     *sorted(Path("examples/blackbox_like").glob("*.txt")),
+    *sorted(Path("examples/probe_suite").glob("*.txt")),
 ]
 
 

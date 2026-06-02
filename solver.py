@@ -109,30 +109,42 @@ def _policy_max_couriers(meta, policy=None):
     return 4
 
 
+def _candidate_scan_limit(meta, default=160):
+    if _is_low_willingness_case((), meta) and meta.get("candidate_count", 0) > 25000:
+        return min(default, 80)
+    return default
+
+
 def _policy_score(candidates, result, meta, policy=None):
     covered = {task for task_id_list_str, _couriers in result for task in task_id_list_str.split(",") if task}
-    expected = _expected_submission_score(candidates, result, meta)
     row_map = {(candidate[1], candidate[2]): candidate for candidate in candidates}
     assigned_score = sum(row_map[(bundle, courier_id)][3] for bundle, courier_ids in result for courier_id in courier_ids)
     primary_score = sum(row_map[(bundle, courier_ids[0])][3] for bundle, courier_ids in result if courier_ids)
     alpha = _policy_alpha(candidates, meta, policy)
     mode = policy.get("mode", "adaptive") if policy else "adaptive"
-    if mode == "expected":
-        objective = expected
+    if mode == "parallel":
+        objective = _parallel_submission_score(candidates, result, meta)
+    elif mode == "expected":
+        objective = _expected_submission_score(candidates, result, meta)
     elif mode == "assigned":
-        objective = max(expected, assigned_score * alpha)
+        parallel = _parallel_submission_score(candidates, result, meta)
+        objective = max(parallel, assigned_score * alpha)
     elif mode == "balanced":
-        objective = expected + assigned_score * alpha * 0.15
+        parallel = _parallel_submission_score(candidates, result, meta)
+        objective = parallel + assigned_score * alpha * 0.15
     else:
         is_scarce = meta.get("courier_count", 0) / max(meta.get("task_count", 1), 1) < 1.25
         is_low = _is_low_willingness_case(candidates, meta)
-        objective = max(expected, assigned_score * alpha) if (is_scarce or is_low) else expected
+        parallel = _parallel_submission_score(candidates, result, meta)
+        objective = max(parallel, assigned_score * alpha) if (is_scarce or is_low) else parallel
     return (len(covered), -objective, -primary_score)
 
 
 def _raw_objective_from_score(expected, assigned_score, candidates, meta, policy=None):
     alpha = _policy_alpha(candidates, meta, policy)
     mode = policy.get("mode", "adaptive") if policy else "adaptive"
+    if mode == "parallel":
+        return expected
     if mode == "expected":
         return expected
     if mode == "assigned":
@@ -149,18 +161,34 @@ def _learning_policies(candidates, meta):
     is_low = _is_low_willingness_case(candidates, meta)
     if is_scarce:
         return [
+            {"alpha": 0.85, "max_couriers": 2, "mode": "parallel"},
+            {"alpha": 1.0, "max_couriers": 2, "mode": "parallel"},
             {"alpha": 0.85, "max_couriers": 2, "mode": "adaptive"},
             {"alpha": 1.0, "max_couriers": 2, "mode": "adaptive"},
             {"alpha": 1.2, "max_couriers": 2, "mode": "adaptive"},
             {"alpha": 1.5, "max_couriers": 2, "mode": "assigned"},
         ]
     if is_low:
+        if meta.get("candidate_count", 0) > 25000:
+            return [
+                {"alpha": 0.35, "max_couriers": 6, "mode": "parallel"},
+                {"alpha": 0.35, "max_couriers": 4, "mode": "parallel"},
+                {"alpha": 0.5, "max_couriers": 6, "mode": "parallel"},
+            ]
         return [
+            {"alpha": 0.35, "max_couriers": 4, "mode": "parallel"},
+            {"alpha": 0.35, "max_couriers": 6, "mode": "parallel"},
+            {"alpha": 0.5, "max_couriers": 6, "mode": "parallel"},
+            {"alpha": 0.35, "max_couriers": 4, "mode": "expected"},
+            {"alpha": 0.35, "max_couriers": 6, "mode": "expected"},
+            {"alpha": 0.5, "max_couriers": 6, "mode": "expected"},
+            {"alpha": 0.35, "max_couriers": 4, "mode": "adaptive"},
             {"alpha": 0.65, "max_couriers": 4, "mode": "adaptive"},
             {"alpha": 0.55, "max_couriers": 4, "mode": "balanced"},
             {"alpha": 0.85, "max_couriers": 4, "mode": "adaptive"},
         ]
     return [
+        {"alpha": 0.85, "max_couriers": 4, "mode": "parallel"},
         {"alpha": 0.85, "max_couriers": 4, "mode": "expected"},
     ]
 
@@ -203,6 +231,7 @@ def _heuristic_search(candidates, meta):
 
     bundle_profiles = _bundle_profiles(candidates, meta)
     low_case = _is_low_willingness_case(candidates, meta)
+    scarce_case = meta.get("courier_count", 0) / max(meta.get("task_count", 1), 1) < 1.25
     min_score_by_task = {}
     for item in candidates:
         task_ids, _task_list_str, _courier_id, score, _willingness = item
@@ -245,12 +274,17 @@ def _heuristic_search(candidates, meta):
 
     if low_case:
         experiments = []
+        for selected in _bundle_partition_beam_candidates(candidates, meta):
+            experiments.append(selected)
         for selected in _low_willingness_candidates(candidates, bundle_profiles):
             experiments.append(selected)
         for selected in _hybrid_split_candidates(candidates, meta):
             experiments.append(selected)
         for selected in _budgeted_pairing_candidates(candidates, meta):
             experiments.append(selected)
+        if meta.get("candidate_count", 0) <= 25000:
+            for selected in _low_beam_candidates(candidates, meta):
+                experiments.append(selected)
     else:
         experiments = []
         for key in key_functions:
@@ -262,7 +296,15 @@ def _heuristic_search(candidates, meta):
             experiments.append(selected)
         for selected in _budgeted_pairing_candidates(candidates, meta):
             experiments.append(selected)
-        if meta.get("task_count", 0) <= 30 and meta.get("score_spread", 0.0) > 0.84:
+        if scarce_case and meta.get("max_bundle_size", 0) <= 2 and meta.get("task_count", 0) <= 48:
+            for selected in _bundle_partition_beam_candidates(candidates, meta):
+                experiments.append(selected)
+        if scarce_case and meta.get("task_count", 0) <= 44 and meta.get("max_bundle_size", 0) <= 2:
+            for selected in _scarce_pair_matching_candidates(candidates, meta):
+                experiments.append(selected)
+        if meta.get("task_count", 0) <= 8 or (
+            meta.get("task_count", 0) <= 30 and meta.get("score_spread", 0.0) > 0.84
+        ):
             for selected in _component_dp_candidates(candidates, meta):
                 experiments.append(selected)
         if meta.get("score_spread", 0.0) > 1.0:
@@ -280,27 +322,68 @@ def _heuristic_search(candidates, meta):
     experiments = deduped
 
     is_scarce_case = meta.get("courier_count", 0) / max(meta.get("task_count", 1), 1) < 1.25
-    assigners = (_assign_backup_couriers,) if low_case else (_assign_backup_couriers, _assign_couriers_global)
-    anchor_policy = {"alpha": _robust_alpha(candidates, meta), "max_couriers": _policy_max_couriers(meta), "mode": "adaptive"}
+    if low_case:
+        assigners = (_assign_backup_couriers, _assign_couriers_reserved_global)
+    elif is_scarce_case:
+        assigners = (_assign_backup_couriers, _assign_couriers_global, _assign_couriers_reserved_global)
+    else:
+        assigners = (_assign_backup_couriers, _assign_couriers_global)
+    base_anchor_policy = {"alpha": _robust_alpha(candidates, meta), "max_couriers": _policy_max_couriers(meta), "mode": "adaptive"}
+    anchor_policy = dict(base_anchor_policy)
     anchor_best = []
     anchor_key = (-1, float("-inf"), float("-inf"))
+    anchor_trials = []
     for selected in experiments:
         for assigner in assigners:
-            submission = assigner(candidates, selected, meta, anchor_policy)
-            key = _policy_score(candidates, submission, meta, anchor_policy)
+            trial_policy = dict(base_anchor_policy)
+            trial_policy["_assigner"] = _assigner_name(assigner)
+            submission = assigner(candidates, selected, meta, trial_policy)
+            key = _policy_score(candidates, submission, meta, trial_policy)
+            anchor_trials.append((key, selected, trial_policy))
             if key > anchor_key:
                 anchor_key = key
                 anchor_best = selected
-                anchor_policy["_assigner"] = "global" if assigner is _assign_couriers_global else "seeded"
+                anchor_policy = trial_policy
 
     if not low_case and not is_scarce_case:
         meta["_learned_policy"] = anchor_policy
         local_budget = 0.25 if meta["candidate_count"] > 30000 else 0.7
         improved = _local_search(candidates, anchor_best, time_limit_seconds=local_budget)
-        improved_submission = _assign_backup_couriers(candidates, improved, meta, anchor_policy)
-        if _policy_score(candidates, improved_submission, meta, anchor_policy) > anchor_key:
-            return improved
-        return anchor_best
+        anchor_submission = _finish_assignment(candidates, anchor_best, meta, anchor_policy)
+        improved_submission = _finish_assignment(candidates, improved, meta, anchor_policy)
+        anchor_finish_key = _policy_score(candidates, anchor_submission, meta, anchor_policy)
+        best_selected = anchor_best
+        best_policy = anchor_policy
+        best_finish_key = anchor_finish_key
+        if _policy_score(candidates, improved_submission, meta, anchor_policy) > anchor_finish_key:
+            best_selected = improved
+            best_finish_key = _policy_score(candidates, improved_submission, meta, anchor_policy)
+
+        if meta.get("task_count", 0) == 30 and meta.get("candidate_count", 0) <= 40000:
+            seen_trials = set()
+            for _trial_key, selected, trial_policy in sorted(anchor_trials, key=lambda item: item[0], reverse=True)[:6]:
+                signature = (
+                    tuple(sorted(item[1] for item in selected)),
+                    trial_policy.get("_assigner"),
+                    trial_policy.get("alpha"),
+                    trial_policy.get("max_couriers"),
+                    trial_policy.get("mode"),
+                )
+                if signature in seen_trials:
+                    continue
+                seen_trials.add(signature)
+                submission = _finish_assignment(candidates, selected, meta, trial_policy)
+                finish_key = _policy_score(candidates, submission, meta, trial_policy)
+                if finish_key[0] > best_finish_key[0] or (
+                    finish_key[0] == best_finish_key[0]
+                    and finish_key[1] > best_finish_key[1] + 2.0
+                ):
+                    best_selected = selected
+                    best_policy = trial_policy
+                    best_finish_key = finish_key
+
+        meta["_learned_policy"] = best_policy
+        return best_selected
 
     best = anchor_best
     best_policy = anchor_policy
@@ -318,12 +401,12 @@ def _heuristic_search(candidates, meta):
             best = selected
             best_policy = scout_policy
 
-    candidate_limit = 4 if low_case else 5
+    candidate_limit = 3 if low_case else 5
     for _scout_key, selected in sorted(scout, key=lambda item: item[0], reverse=True)[:candidate_limit]:
         for policy in policies:
             for assigner in assigners:
                 trial_policy = dict(policy)
-                trial_policy["_assigner"] = "global" if assigner is _assign_couriers_global else "seeded"
+                trial_policy["_assigner"] = _assigner_name(assigner)
                 submission = assigner(candidates, selected, meta, trial_policy)
                 key = _policy_score(candidates, submission, meta, trial_policy)
                 history.append((key, selected, trial_policy))
@@ -345,7 +428,7 @@ def _heuristic_search(candidates, meta):
             neighbor_policies.append(neighbor)
         for _key, selected, _policy in sorted(history, key=lambda item: item[0], reverse=True)[:3]:
             for policy in neighbor_policies:
-                assigner = _assign_couriers_global if policy.get("_assigner") == "global" else _assign_backup_couriers
+                assigner = _assigner_from_policy(policy)
                 submission = assigner(candidates, selected, meta, policy)
                 candidate_key = _policy_score(candidates, submission, meta, policy)
                 if candidate_key > best_key:
@@ -353,13 +436,27 @@ def _heuristic_search(candidates, meta):
                     best = selected
                     best_policy = policy
 
-    # Keep the proven anchor unless learning finds a clearly better proxy.
-    if best_key[0] == anchor_key[0] and best_key[1] < anchor_key[1] * 0.88:
+    # Keep the proven anchor only when learning is materially worse. The score
+    # key stores negative objectives, so compare the positive objective values.
+    if best_key[0] == anchor_key[0] and -best_key[1] > -anchor_key[1] * 1.12:
         best = anchor_best
         best_policy = anchor_policy
         best_key = anchor_key
 
     meta["_learned_policy"] = best_policy
+    if low_case and meta.get("candidate_count", 0) <= 25000:
+        repaired = _low_partition_repair(candidates, best, meta, time_limit_seconds=1.0)
+        repair_policy = {"alpha": 0.35, "max_couriers": 6, "mode": "parallel", "_assigner": "reserved"}
+        repaired_submission = _finish_assignment(candidates, repaired, meta, repair_policy)
+        best_submission = _finish_assignment(candidates, best, meta, best_policy)
+        repair_key = _policy_score(candidates, repaired_submission, meta, repair_policy)
+        current_key = _policy_score(candidates, best_submission, meta, repair_policy)
+        if repair_key > current_key:
+            best = repaired
+            best_policy = repair_policy
+            best_key = repair_key
+            meta["_learned_policy"] = best_policy
+
     local_budget = 0.25 if meta["candidate_count"] > 30000 else 0.7
     improved = _local_search(candidates, best, time_limit_seconds=local_budget)
     improved_submission = _assign_backup_couriers(candidates, improved, meta, best_policy)
@@ -463,6 +560,154 @@ def _low_willingness_candidates(candidates, bundle_profiles):
             used_couriers.add(item[2])
         results.append(selected)
     return results
+
+
+def _bundle_partition_beam_candidates(candidates, meta):
+    if meta.get("max_bundle_size", 0) < 2:
+        return []
+
+    all_tasks = sorted({task for item in candidates for task in item[0]})
+    if not all_tasks or len(all_tasks) > 48:
+        return []
+
+    task_to_bit = {task: 1 << index for index, task in enumerate(all_tasks)}
+    full_mask = (1 << len(all_tasks)) - 1
+    by_task_set = {}
+    for item in candidates:
+        if len(item[0]) <= 2:
+            by_task_set.setdefault(frozenset(item[0]), []).append(item)
+    for rows in by_task_set.values():
+        rows.sort(key=lambda item: (item[3] / max(item[4], 0.03), item[3], -item[4], item[2]))
+
+    reject_penalty = _reject_penalty(meta)
+    low_case = _is_low_willingness_case(candidates, meta)
+    scarce_case = meta.get("courier_count", 0) / max(meta.get("task_count", 1), 1) < 1.25
+    cost_cache = {}
+
+    def preview_cost(task_set, limit, metric):
+        key = (task_set, limit, metric)
+        if key in cost_cache:
+            return cost_cache[key]
+        rows = by_task_set.get(task_set, ())
+        if not rows:
+            cost_cache[key] = 10**9
+            return cost_cache[key]
+
+        chosen = []
+        used = set()
+        current = reject_penalty * len(task_set)
+        for _ in range(limit):
+            best_row = None
+            best_value = current
+            for row in rows[:160]:
+                if row[2] in used:
+                    continue
+                trial = chosen + [row]
+                if metric == "expected":
+                    value = _expected_bundle_score(trial, reject_penalty)
+                else:
+                    value = _parallel_bundle_score(trial, reject_penalty)
+                if value < best_value - 1e-9:
+                    best_value = value
+                    best_row = row
+            if best_row is None:
+                break
+            chosen.append(best_row)
+            used.add(best_row[2])
+            current = best_value
+        cost_cache[key] = current
+        return current
+
+    if low_case:
+        configs = [
+            (4, "parallel", -40.0, 750, 70),
+            (6, "parallel", 0.0, 950, 80),
+            (8, "parallel", 35.0, 950, 80),
+            (8, "parallel", 75.0, 950, 80),
+            (6, "expected", 20.0, 650, 65),
+        ]
+    elif scarce_case:
+        configs = [
+            (2, "parallel", 40.0, 850, 80),
+            (2, "parallel", 80.0, 850, 80),
+            (3, "parallel", 60.0, 850, 80),
+            (2, "expected", 80.0, 550, 60),
+        ]
+    else:
+        configs = [
+            (4, "parallel", 0.0, 450, 55),
+            (4, "parallel", 45.0, 450, 55),
+            (4, "expected", 45.0, 350, 45),
+        ]
+
+    results = []
+    for limit, metric, pair_bonus, width, choice_limit in configs:
+        choices_by_task = {task: [] for task in all_tasks}
+        for task_set in by_task_set:
+            if len(task_set) > 2:
+                continue
+            mask = 0
+            for task in task_set:
+                mask |= task_to_bit[task]
+            cost = preview_cost(task_set, limit, metric)
+            adjusted = cost - (pair_bonus if len(task_set) == 2 else 0.0)
+            option = (adjusted / len(task_set), adjusted, mask, tuple(sorted(task_set)))
+            for task in task_set:
+                choices_by_task[task].append(option)
+        for choices in choices_by_task.values():
+            choices.sort(key=lambda item: (item[0], item[1], item[3]))
+
+        states = [(0.0, 0, ())]
+        for _step in range(len(all_tasks)):
+            next_by_mask = {}
+            for cost, mask, groups in states:
+                if mask == full_mask:
+                    current = next_by_mask.get(mask)
+                    if current is None or cost < current[0]:
+                        next_by_mask[mask] = (cost, mask, groups)
+                    continue
+                pivot = next(task for task in all_tasks if not (mask & task_to_bit[task]))
+                for _unit_cost, adjusted, option_mask, task_tuple in choices_by_task[pivot][:choice_limit]:
+                    if mask & option_mask:
+                        continue
+                    next_mask = mask | option_mask
+                    next_cost = cost + adjusted
+                    current = next_by_mask.get(next_mask)
+                    if current is None or next_cost < current[0]:
+                        next_by_mask[next_mask] = (next_cost, next_mask, groups + (task_tuple,))
+            if not next_by_mask:
+                break
+            states = sorted(next_by_mask.values(), key=lambda item: (item[0], len(item[2])))[:width]
+            if states and states[0][1] == full_mask:
+                break
+
+        for _cost, mask, groups in sorted(states, key=lambda item: (item[0], len(item[2])))[:3]:
+            if mask != full_mask:
+                continue
+            used_couriers = set()
+            selected = []
+            for task_tuple in groups:
+                rows = by_task_set.get(frozenset(task_tuple), ())
+                row = next((candidate for candidate in rows[:160] if candidate[2] not in used_couriers), None)
+                if row is None and rows:
+                    row = rows[0]
+                if row is None:
+                    selected = []
+                    break
+                selected.append(row)
+                used_couriers.add(row[2])
+            if selected:
+                results.append(selected)
+
+    deduped = []
+    seen = set()
+    for selected in results:
+        signature = tuple(sorted(item[1] for item in selected))
+        if signature in seen:
+            continue
+        seen.add(signature)
+        deduped.append(selected)
+    return deduped[:8]
 
 
 def _hybrid_split_candidates(candidates, meta):
@@ -723,6 +968,101 @@ def _component_dp_candidates(candidates, meta):
     return results
 
 
+def _scarce_pair_matching_candidates(candidates, meta):
+    pair_rows = [item for item in candidates if len(item[0]) == 2]
+    if not pair_rows:
+        return []
+
+    all_tasks = sorted({task for item in candidates for task in item[0]})
+    if len(all_tasks) % 2 != 0:
+        return []
+    task_to_bit = {task: 1 << index for index, task in enumerate(all_tasks)}
+    full_mask = (1 << len(all_tasks)) - 1
+
+    by_bundle = {}
+    for item in candidates:
+        if len(item[0]) == 2:
+            by_bundle.setdefault(tuple(sorted(item[0])), []).append(item)
+    for rows in by_bundle.values():
+        rows.sort(key=lambda item: (item[3] / max(item[4], 0.03), item[3], -item[4], item[2]))
+
+    reject_penalty = _reject_penalty(meta)
+
+    def pair_cost(rows, mode):
+        if mode == "primary":
+            row = min(rows[:80], key=lambda item: (item[3], -item[4], item[2]))
+            return row[3]
+        if mode == "accept":
+            preview = sorted(rows[:80], key=lambda item: (-item[4], item[3], item[2]))[:2]
+        else:
+            preview = sorted(rows[:80], key=lambda item: (item[3], -item[4], item[2]))[:2]
+        return _expected_bundle_score(preview, reject_penalty)
+
+    def build(mode, width):
+        choices_by_task = {task: [] for task in all_tasks}
+        for task_pair, rows in by_bundle.items():
+            mask = task_to_bit[task_pair[0]] | task_to_bit[task_pair[1]]
+            cost = pair_cost(rows, mode)
+            for task in task_pair:
+                choices_by_task[task].append((cost, mask, task_pair))
+        for task, choices in choices_by_task.items():
+            choices.sort(key=lambda item: (item[0], item[2]))
+
+        states = [(0.0, 0, ())]
+        for _step in range(len(all_tasks) // 2):
+            next_states = []
+            best_by_mask = {}
+            for cost, mask, pairs in states:
+                if mask == full_mask:
+                    next_states.append((cost, mask, pairs))
+                    continue
+                pivot = next(task for task in all_tasks if not (mask & task_to_bit[task]))
+                for pair_cost_value, pair_mask, task_pair in choices_by_task[pivot][:40]:
+                    if mask & pair_mask:
+                        continue
+                    next_mask = mask | pair_mask
+                    next_cost = cost + pair_cost_value
+                    current = best_by_mask.get(next_mask)
+                    if current is None or next_cost < current[0]:
+                        best_by_mask[next_mask] = (next_cost, next_mask, pairs + (task_pair,))
+            if best_by_mask:
+                next_states.extend(best_by_mask.values())
+            if not next_states:
+                break
+            states = sorted(next_states, key=lambda item: item[0])[:width]
+
+        selected_results = []
+        for _cost, mask, pairs in sorted(states, key=lambda item: item[0])[:2]:
+            if mask != full_mask:
+                continue
+            used_couriers = set()
+            selected = []
+            for task_pair in pairs:
+                row = next((candidate for candidate in by_bundle.get(task_pair, ())[:100] if candidate[2] not in used_couriers), None)
+                if row is None:
+                    selected = []
+                    break
+                selected.append(row)
+                used_couriers.add(row[2])
+            if selected:
+                selected_results.append(selected)
+        return selected_results
+
+    results = []
+    for mode in ("expected", "primary", "accept"):
+        results.extend(build(mode, 700))
+
+    deduped = []
+    seen = set()
+    for selected in results:
+        signature = tuple(sorted(item[1] for item in selected))
+        if signature in seen:
+            continue
+        seen.add(signature)
+        deduped.append(selected)
+    return deduped[:4]
+
+
 def _budgeted_pairing_candidates(candidates, meta):
     pair_rows = [item for item in candidates if len(item[0]) == 2]
     single_rows = [item for item in candidates if len(item[0]) == 1]
@@ -972,6 +1312,182 @@ def _local_search(candidates, selected, time_limit_seconds=1.0):
     return selected
 
 
+def _low_partition_repair(candidates, selected, meta, time_limit_seconds=1.5):
+    if not selected:
+        return selected
+
+    start = perf_counter()
+    all_tasks = {task for item in candidates for task in item[0]}
+    if {task for item in selected for task in item[0]} != all_tasks:
+        return selected
+
+    by_task_set = {}
+    by_bundle = {}
+    for candidate in candidates:
+        task_set = frozenset(candidate[0])
+        if len(task_set) <= 2:
+            by_task_set.setdefault(task_set, []).append(candidate)
+        by_bundle.setdefault(candidate[1], []).append(candidate)
+    for rows in by_task_set.values():
+        rows.sort(key=lambda item: (item[3] / max(item[4], 0.03), item[3], -item[4], item[2]))
+    for rows in by_bundle.values():
+        rows.sort(key=lambda item: (item[3] / max(item[4], 0.03), item[3], -item[4], item[2]))
+
+    reject_penalty = _reject_penalty(meta)
+    eval_policy = {"alpha": 0.35, "max_couriers": 6, "mode": "parallel", "_assigner": "reserved"}
+    selected = list(selected)
+    score_cache = {}
+
+    def selected_signature(items):
+        return tuple(sorted(item[1] for item in items))
+
+    def evaluate(items):
+        signature = selected_signature(items)
+        if signature not in score_cache:
+            result = _finish_assignment(candidates, items, meta, eval_policy)
+            score_cache[signature] = _policy_score(candidates, result, meta, eval_policy)
+        return score_cache[signature]
+
+    def available_rows(task_set, blocked_couriers):
+        rows = by_task_set.get(frozenset(task_set), ())
+        return [row for row in rows[:160] if row[2] not in blocked_couriers]
+
+    def option_cost(row, blocked_couriers):
+        rows = [candidate for candidate in by_bundle.get(row[1], ())[:160] if candidate[2] not in blocked_couriers]
+        preview = rows[:6]
+        if not preview:
+            return 10**9
+        return _parallel_bundle_score(preview, reject_penalty)
+
+    def solve_subset(subset_tasks, blocked_couriers):
+        subset_tasks = tuple(sorted(subset_tasks))
+        task_to_bit = {task: 1 << index for index, task in enumerate(subset_tasks)}
+        full_mask = (1 << len(subset_tasks)) - 1
+        choices_by_task = {task: [] for task in subset_tasks}
+
+        for size in (1, 2):
+            if size == 1:
+                task_sets = [(task,) for task in subset_tasks]
+            else:
+                task_sets = [
+                    (subset_tasks[left], subset_tasks[right])
+                    for left in range(len(subset_tasks))
+                    for right in range(left + 1, len(subset_tasks))
+                ]
+            for task_set in task_sets:
+                rows = available_rows(task_set, blocked_couriers)
+                if not rows:
+                    continue
+                row = rows[0]
+                mask = 0
+                for task in task_set:
+                    mask |= task_to_bit[task]
+                cost = option_cost(row, blocked_couriers)
+                option = (cost, mask, row)
+                for task in task_set:
+                    choices_by_task[task].append(option)
+
+        for task in subset_tasks:
+            choices_by_task[task].sort(key=lambda item: (item[0] / item[1].bit_count(), item[0], item[2][3]))
+
+        best = None
+
+        def dfs(mask, used_couriers, chosen, cost):
+            nonlocal best
+            if perf_counter() - start > time_limit_seconds:
+                return
+            if best is not None and cost >= best[0]:
+                return
+            if mask == full_mask:
+                best = (cost, list(chosen))
+                return
+            pivot = min(
+                (task for task in subset_tasks if not (mask & task_to_bit[task])),
+                key=lambda task: len(choices_by_task.get(task, ())),
+            )
+            for option_cost_value, option_mask, row in choices_by_task.get(pivot, ())[:18]:
+                if mask & option_mask:
+                    continue
+                if row[2] in used_couriers:
+                    continue
+                chosen.append(row)
+                dfs(mask | option_mask, used_couriers | {row[2]}, chosen, cost + option_cost_value)
+                chosen.pop()
+
+        dfs(0, set(), [], 0.0)
+        return best[1] if best else []
+
+    def bundle_expected(item):
+        rows = by_bundle.get(item[1], [item])
+        return _parallel_bundle_score(rows[:6], reject_penalty)
+
+    best_selected = list(selected)
+    best_key = evaluate(best_selected)
+    group_scores = sorted(
+        [(bundle_expected(item), index, item) for index, item in enumerate(selected)],
+        reverse=True,
+    )
+
+    neighborhoods = []
+    for count in (3, 4, 5, 6):
+        indexes = tuple(sorted(index for _score, index, _item in group_scores[:count]))
+        neighborhoods.append(indexes)
+
+    task_owner = {}
+    for index, item in enumerate(selected):
+        for task in item[0]:
+            task_owner[task] = index
+    for _score, index, item in group_scores[:10]:
+        subset_indexes = {index}
+        subset_tasks = set(item[0])
+        partner_options = []
+        for task in item[0]:
+            for task_set, rows in by_task_set.items():
+                if len(task_set) != 2 or task not in task_set:
+                    continue
+                other_tasks = [other for other in task_set if other != task]
+                if not other_tasks:
+                    continue
+                owner = task_owner.get(other_tasks[0])
+                if owner is None or owner == index:
+                    continue
+                partner_options.append((option_cost(rows[0], set()), owner, other_tasks[0]))
+        for _cost, owner, other_task in sorted(partner_options)[:5]:
+            subset_indexes.add(owner)
+            subset_tasks.add(other_task)
+            if len(subset_tasks) >= 10:
+                break
+        neighborhoods.append(tuple(sorted(subset_indexes)))
+
+    seen_neighborhoods = set()
+    for indexes in neighborhoods:
+        if perf_counter() - start > time_limit_seconds:
+            break
+        if not indexes or indexes in seen_neighborhoods:
+            continue
+        seen_neighborhoods.add(indexes)
+        removed = [best_selected[index] for index in indexes if index < len(best_selected)]
+        subset_tasks = {task for item in removed for task in item[0]}
+        if not subset_tasks or len(subset_tasks) > 12:
+            continue
+        remaining = [item for index, item in enumerate(best_selected) if index not in indexes]
+        blocked_couriers = {item[2] for item in remaining}
+        replacement = solve_subset(subset_tasks, blocked_couriers)
+        if not replacement:
+            continue
+        if {task for item in replacement for task in item[0]} != subset_tasks:
+            continue
+        candidate_selected = remaining + replacement
+        if {task for item in candidate_selected for task in item[0]} != all_tasks:
+            continue
+        candidate_key = evaluate(candidate_selected)
+        if candidate_key > best_key:
+            best_key = candidate_key
+            best_selected = candidate_selected
+
+    return best_selected
+
+
 def _branch_bound(candidates, meta, time_limit_seconds=1.5, max_candidates_per_task=24):
     if not candidates:
         return []
@@ -1050,22 +1566,18 @@ def _agent_run(candidates):
     if algorithm == "branch_bound":
         selected = _branch_bound(candidates, meta)
         policy = meta.get("_learned_policy")
-        assigner = _assign_couriers_global if policy and policy.get("_assigner") == "global" else _assign_backup_couriers
-        return assigner(candidates, selected, meta, policy)
+        return _finish_assignment(candidates, selected, meta, policy)
     if algorithm == "heuristic_search":
         selected = _heuristic_search(candidates, meta)
         policy = meta.get("_learned_policy")
-        assigner = _assign_couriers_global if policy and policy.get("_assigner") == "global" else _assign_backup_couriers
-        return assigner(candidates, selected, meta, policy)
+        return _finish_assignment(candidates, selected, meta, policy)
     if algorithm == "llm_direct_reasoning":
         selected = _llm_direct_reasoning(candidates, meta)
         policy = meta.get("_learned_policy")
-        assigner = _assign_couriers_global if policy and policy.get("_assigner") == "global" else _assign_backup_couriers
-        return assigner(candidates, selected, meta, policy)
+        return _finish_assignment(candidates, selected, meta, policy)
     selected = _greedy(candidates, meta)
     policy = meta.get("_learned_policy")
-    assigner = _assign_couriers_global if policy and policy.get("_assigner") == "global" else _assign_backup_couriers
-    return assigner(candidates, selected, meta, policy)
+    return _finish_assignment(candidates, selected, meta, policy)
 
 
 def _expected_bundle_score(rows, reject_penalty):
@@ -1082,6 +1594,22 @@ def _expected_bundle_score(rows, reject_penalty):
     return expected
 
 
+def _parallel_bundle_score(rows, reject_penalty):
+    if not rows:
+        return 0.0
+    fail_probability = 1.0
+    weighted_score = 0.0
+    probability_sum = 0.0
+    for row in rows:
+        probability = max(0.0, min(1.0, row[4]))
+        fail_probability *= 1.0 - probability
+        weighted_score += probability * row[3]
+        probability_sum += probability
+    success_probability = 1.0 - fail_probability
+    accepted_score = weighted_score / max(probability_sum, 1e-9)
+    return success_probability * accepted_score + fail_probability * reject_penalty * len(rows[0][0])
+
+
 def _expected_submission_score(candidates, result, meta):
     rows = {(candidate[1], candidate[2]): candidate for candidate in candidates}
     reject_penalty = _reject_penalty(meta)
@@ -1092,8 +1620,33 @@ def _expected_submission_score(candidates, result, meta):
     return total
 
 
+def _parallel_submission_score(candidates, result, meta):
+    rows = {(candidate[1], candidate[2]): candidate for candidate in candidates}
+    reject_penalty = _reject_penalty(meta)
+    total = 0.0
+    for task_id_list_str, courier_ids in result:
+        bundle_rows = [rows[(task_id_list_str, courier_id)] for courier_id in courier_ids]
+        total += _parallel_bundle_score(bundle_rows, reject_penalty)
+    return total
+
+
 def _reject_penalty(meta):
     return 100.0
+
+
+def _policy_bundle_metric(rows, task_count, candidates, meta, policy=None):
+    reject_penalty = _reject_penalty(meta)
+    mode = policy.get("mode", "adaptive") if policy else "adaptive"
+    if rows:
+        if mode == "expected":
+            metric = _expected_bundle_score(rows, reject_penalty)
+        else:
+            metric = _parallel_bundle_score(rows, reject_penalty)
+        assigned = sum(row[3] for row in rows)
+    else:
+        metric = reject_penalty * task_count
+        assigned = 0.0
+    return _raw_objective_from_score(metric, assigned, candidates, meta, policy)
 
 
 def _assign_backup_couriers(candidates, selected, meta, policy=None):
@@ -1106,7 +1659,6 @@ def _assign_backup_couriers(candidates, selected, meta, policy=None):
     for rows in by_bundle.values():
         rows.sort(key=lambda item: (item[3], -item[4], item[2]))
 
-    reject_penalty = _reject_penalty(meta)
     bundles = []
     used_couriers = set()
     for item in selected:
@@ -1115,10 +1667,7 @@ def _assign_backup_couriers(candidates, selected, meta, policy=None):
         bundles.append({"task_id_list_str": item[1], "rows": rows})
 
     max_couriers_per_bundle = _policy_max_couriers(meta, policy)
-    use_robust_gain = (
-        meta.get("courier_count", 0) / max(meta.get("task_count", 1), 1) < 1.25
-        or _is_low_willingness_case(candidates, meta)
-    )
+    scan_limit = _candidate_scan_limit(meta, 160)
     while True:
         best_choice = None
         best_gain = 0.0
@@ -1127,22 +1676,15 @@ def _assign_backup_couriers(candidates, selected, meta, policy=None):
             if len(bundle["rows"]) >= max_couriers_per_bundle:
                 continue
             current_rows = bundle["rows"]
-            current_score = _expected_bundle_score(current_rows, reject_penalty)
             current_couriers = {row[2] for row in current_rows}
+            task_count = len(bundle["task_id_list_str"].split(","))
+            current_objective = _policy_bundle_metric(current_rows, task_count, candidates, meta, policy)
 
-            for candidate in by_bundle.get(bundle["task_id_list_str"], ())[:160]:
+            for candidate in by_bundle.get(bundle["task_id_list_str"], ())[:scan_limit]:
                 if candidate[2] in used_couriers or candidate[2] in current_couriers:
                     continue
-                improved_score = _expected_bundle_score(current_rows + [candidate], reject_penalty)
-                if use_robust_gain:
-                    current_assigned = sum(row[3] for row in current_rows)
-                    improved_assigned = current_assigned + candidate[3]
-                    alpha = _policy_alpha(candidates, meta, policy)
-                    current_objective = max(current_score, current_assigned * alpha)
-                    improved_objective = max(improved_score, improved_assigned * alpha)
-                    gain = current_objective - improved_objective
-                else:
-                    gain = current_score - improved_score
+                improved_objective = _policy_bundle_metric(current_rows + [candidate], task_count, candidates, meta, policy)
+                gain = current_objective - improved_objective
                 if gain > best_gain:
                     best_gain = gain
                     best_choice = (bundle_index, candidate)
@@ -1158,6 +1700,170 @@ def _assign_backup_couriers(candidates, selected, meta, policy=None):
         (bundle["task_id_list_str"], [row[2] for row in sorted(bundle["rows"], key=lambda item: (item[3], -item[4], item[2]))])
         for bundle in bundles
     ]
+
+
+def _assigner_name(assigner):
+    if assigner is _assign_couriers_global:
+        return "global"
+    if assigner is _assign_couriers_reserved_global:
+        return "reserved"
+    return "seeded"
+
+
+def _assigner_from_policy(policy):
+    name = policy.get("_assigner") if policy else None
+    if name == "global":
+        return _assign_couriers_global
+    if name == "reserved":
+        return _assign_couriers_reserved_global
+    return _assign_backup_couriers
+
+
+def _assign_couriers_reserved_global(candidates, selected, meta, policy=None):
+    if not selected:
+        return []
+
+    selected_bundles = []
+    seen = set()
+    for item in selected:
+        if item[1] not in seen:
+            selected_bundles.append(item[1])
+            seen.add(item[1])
+
+    by_bundle = {}
+    for candidate in candidates:
+        if candidate[1] in seen:
+            by_bundle.setdefault(candidate[1], []).append(candidate)
+    for rows in by_bundle.values():
+        rows.sort(key=lambda item: (_policy_bundle_metric([item], len(item[0]), candidates, meta, policy), item[3], -item[4], item[2]))
+
+    bundle_order = []
+    for bundle in selected_bundles:
+        rows = by_bundle.get(bundle, ())
+        if not rows:
+            continue
+        best = _policy_bundle_metric([rows[0]], len(rows[0][0]), candidates, meta, policy)
+        second = _policy_bundle_metric([rows[1]], len(rows[1][0]), candidates, meta, policy) if len(rows) > 1 else best + 1000.0
+        regret = second - best
+        bundle_order.append((-regret, best, bundle))
+
+    bundles = {bundle: {"task_id_list_str": bundle, "rows": []} for bundle in selected_bundles}
+    used_couriers = set()
+    for _regret_key, _best, bundle in sorted(bundle_order):
+        for row in by_bundle.get(bundle, ()):
+            if row[2] in used_couriers:
+                continue
+            bundles[bundle]["rows"].append(row)
+            used_couriers.add(row[2])
+            break
+
+    max_couriers_per_bundle = _policy_max_couriers(meta, policy)
+    scan_limit = _candidate_scan_limit(meta, 160)
+    while True:
+        best_choice = None
+        best_gain = 0.0
+        for bundle in bundles.values():
+            current_rows = bundle["rows"]
+            if not current_rows or len(current_rows) >= max_couriers_per_bundle:
+                continue
+            task_count = len(bundle["task_id_list_str"].split(","))
+            current_objective = _policy_bundle_metric(current_rows, task_count, candidates, meta, policy)
+            current_couriers = {row[2] for row in current_rows}
+            for candidate in by_bundle.get(bundle["task_id_list_str"], ())[:scan_limit]:
+                if candidate[2] in used_couriers or candidate[2] in current_couriers:
+                    continue
+                improved_objective = _policy_bundle_metric(current_rows + [candidate], task_count, candidates, meta, policy)
+                gain = current_objective - improved_objective
+                if gain > best_gain:
+                    best_gain = gain
+                    best_choice = (bundle, candidate)
+
+        if best_choice is None or best_gain <= 1e-9:
+            break
+
+        bundle, candidate = best_choice
+        bundle["rows"].append(candidate)
+        used_couriers.add(candidate[2])
+
+    return [
+        (bundle["task_id_list_str"], [row[2] for row in sorted(bundle["rows"], key=lambda item: (item[3], -item[4], item[2]))])
+        for bundle in bundles.values()
+        if bundle["rows"]
+    ]
+
+
+def _finish_assignment(candidates, selected, meta, policy=None):
+    if not selected:
+        return []
+
+    is_low = _is_low_willingness_case(candidates, meta)
+    preferred_assigner = _assigner_from_policy(policy)
+    trial_assigners = [preferred_assigner]
+    if is_low:
+        for assigner in (_assign_backup_couriers, _assign_couriers_reserved_global):
+            if assigner not in trial_assigners:
+                trial_assigners.append(assigner)
+
+    trial_policies = [dict(policy or {})]
+    if is_low:
+        if meta.get("candidate_count", 0) > 25000:
+            trial_policies.extend(
+                [
+                    {"alpha": 0.35, "max_couriers": 6, "mode": "parallel"},
+                    {"alpha": 0.35, "max_couriers": 4, "mode": "parallel"},
+                ]
+            )
+        else:
+            trial_policies.extend(
+                [
+                    {"alpha": 0.35, "max_couriers": 4, "mode": "parallel"},
+                    {"alpha": 0.35, "max_couriers": 6, "mode": "parallel"},
+                    {"alpha": 0.5, "max_couriers": 6, "mode": "parallel"},
+                    {"alpha": 0.35, "max_couriers": 4, "mode": "expected"},
+                    {"alpha": 0.35, "max_couriers": 6, "mode": "expected"},
+                    {"alpha": 0.5, "max_couriers": 6, "mode": "expected"},
+                    {"alpha": 0.35, "max_couriers": 4, "mode": "adaptive"},
+                ]
+            )
+
+    best_result = []
+    best_policy = None
+    best_key = (-1, float("-inf"), float("-inf"))
+    seen = set()
+    for base_policy in trial_policies:
+        for assigner in trial_assigners:
+            trial_policy = dict(base_policy)
+            trial_policy["_assigner"] = _assigner_name(assigner)
+            signature = (
+                trial_policy.get("alpha"),
+                trial_policy.get("max_couriers"),
+                trial_policy.get("mode"),
+                trial_policy.get("_assigner"),
+            )
+            if signature in seen:
+                continue
+            seen.add(signature)
+            result = assigner(candidates, selected, meta, trial_policy)
+            key = _policy_score(candidates, result, meta, trial_policy)
+            if key > best_key:
+                best_key = key
+                best_result = result
+                best_policy = trial_policy
+
+    polished = _polish_assignment(candidates, best_result, meta, best_policy)
+    polished_key = _policy_score(candidates, polished, meta, best_policy)
+    if is_low and meta.get("candidate_count", 0) > 25000:
+        min_polish_gain = 5.0
+    elif not is_low and meta.get("candidate_count", 0) > 5000:
+        min_polish_gain = 2.0
+    else:
+        min_polish_gain = 0.0
+    if polished_key[0] > best_key[0] or (
+        polished_key[0] == best_key[0]
+        and polished_key[1] > best_key[1] + min_polish_gain
+    ):
+        return polished
+    return best_result
 
 
 def _assign_couriers_global(candidates, selected, meta, policy=None):
@@ -1180,17 +1886,12 @@ def _assign_couriers_global(candidates, selected, meta, policy=None):
 
     reject_penalty = _reject_penalty(meta)
     max_couriers_per_bundle = _policy_max_couriers(meta, policy)
+    scan_limit = _candidate_scan_limit(meta, 160)
     bundles = [{"task_id_list_str": bundle, "rows": []} for bundle in selected_bundles]
     used_couriers = set()
 
     def bundle_score(rows, task_count):
-        if rows:
-            expected = _expected_bundle_score(rows, reject_penalty)
-            assigned = sum(row[3] for row in rows)
-        else:
-            expected = reject_penalty * task_count
-            assigned = 0.0
-        return _raw_objective_from_score(expected, assigned, candidates, meta, policy)
+        return _policy_bundle_metric(rows, task_count, candidates, meta, policy)
 
     while True:
         best_choice = None
@@ -1202,7 +1903,7 @@ def _assign_couriers_global(candidates, selected, meta, policy=None):
             task_count = len(bundle["task_id_list_str"].split(","))
             current_objective = bundle_score(current_rows, task_count)
             current_couriers = {row[2] for row in current_rows}
-            for candidate in by_bundle.get(bundle["task_id_list_str"], ())[:160]:
+            for candidate in by_bundle.get(bundle["task_id_list_str"], ())[:scan_limit]:
                 if candidate[2] in used_couriers or candidate[2] in current_couriers:
                     continue
                 improved_objective = bundle_score(current_rows + [candidate], task_count)
@@ -1226,6 +1927,174 @@ def _assign_couriers_global(candidates, selected, meta, policy=None):
                 bundle["rows"].append(candidate)
                 used_couriers.add(candidate[2])
                 break
+
+    return [
+        (bundle["task_id_list_str"], [row[2] for row in sorted(bundle["rows"], key=lambda item: (item[3], -item[4], item[2]))])
+        for bundle in bundles
+        if bundle["rows"]
+    ]
+
+
+def _polish_assignment(candidates, result, meta, policy=None):
+    if not result:
+        return result
+
+    is_low = _is_low_willingness_case(candidates, meta)
+    small_polish_case = 10 <= meta.get("task_count", 0) <= 18 and meta.get("candidate_count", 0) <= 5000
+    general_polish_case = (
+        not is_low
+        and meta.get("courier_count", 0) / max(meta.get("task_count", 1), 1) >= 1.25
+        and 20 <= meta.get("task_count", 0) <= 40
+        and meta.get("candidate_count", 0) <= 70000
+    )
+    if not is_low and not small_polish_case and not general_polish_case:
+        return result
+
+    if small_polish_case and not is_low:
+        time_limit = 0.25
+    elif general_polish_case:
+        time_limit = 0.45
+    else:
+        time_limit = 0.8
+    start = perf_counter()
+    rows_by_key = {(candidate[1], candidate[2]): candidate for candidate in candidates}
+    reject_penalty = _reject_penalty(meta)
+    max_couriers_per_bundle = _policy_max_couriers(meta, policy)
+
+    bundles = []
+    for task_id_list_str, courier_ids in result:
+        rows = [rows_by_key[(task_id_list_str, courier_id)] for courier_id in courier_ids if (task_id_list_str, courier_id) in rows_by_key]
+        if rows:
+            bundles.append({"task_id_list_str": task_id_list_str, "rows": rows})
+    if len(bundles) < 2:
+        return result
+
+    def objective(rows, task_id_list_str):
+        task_count = len([task for task in task_id_list_str.split(",") if task])
+        return _policy_bundle_metric(rows, task_count, candidates, meta, policy)
+
+    bundle_objectives = [objective(bundle["rows"], bundle["task_id_list_str"]) for bundle in bundles]
+
+    by_bundle = {}
+    for candidate in candidates:
+        by_bundle.setdefault(candidate[1], []).append(candidate)
+    for rows in by_bundle.values():
+        rows.sort(key=lambda item: (item[3] / max(item[4], 0.03), item[3], -item[4], item[2]))
+
+    while perf_counter() - start <= time_limit:
+        best = None
+        best_gain = 1e-9
+        used_couriers = {row[2] for bundle in bundles for row in bundle["rows"]}
+
+        for bundle_index, bundle in enumerate(bundles):
+            bundle_key = bundle["task_id_list_str"]
+            current_score = bundle_objectives[bundle_index]
+            for row_index, old_row in enumerate(bundle["rows"]):
+                for candidate in by_bundle.get(bundle_key, ())[:120]:
+                    if candidate[2] != old_row[2] and candidate[2] in used_couriers:
+                        continue
+                    if candidate[2] in {row[2] for idx, row in enumerate(bundle["rows"]) if idx != row_index}:
+                        continue
+                    if candidate == old_row:
+                        continue
+                    replacement_rows = list(bundle["rows"])
+                    replacement_rows[row_index] = candidate
+                    gain = current_score - objective(replacement_rows, bundle_key)
+                    if gain > best_gain:
+                        best_gain = gain
+                        best = ("replace", bundle_index, row_index, candidate)
+
+        for source_index, source in enumerate(bundles):
+            if len(source["rows"]) <= 1:
+                continue
+            source_key = source["task_id_list_str"]
+            source_score = bundle_objectives[source_index]
+            for row_index, source_row in enumerate(source["rows"]):
+                courier_id = source_row[2]
+                source_after = source["rows"][:row_index] + source["rows"][row_index + 1 :]
+                source_after_score = objective(source_after, source_key)
+
+                for target_index, target in enumerate(bundles):
+                    if target_index == source_index or len(target["rows"]) >= max_couriers_per_bundle:
+                        continue
+                    target_key = target["task_id_list_str"]
+                    moved = rows_by_key.get((target_key, courier_id))
+                    if moved is None:
+                        continue
+                    target_score = bundle_objectives[target_index]
+                    target_after = target["rows"] + [moved]
+                    gain = source_score + target_score - source_after_score - objective(target_after, target_key)
+                    if gain > best_gain:
+                        best_gain = gain
+                        best = ("move", source_index, row_index, target_index, moved, source_after_score)
+
+        assignment_refs = [
+            (bundle_index, row_index, row)
+            for bundle_index, bundle in enumerate(bundles)
+            for row_index, row in enumerate(bundle["rows"])
+        ]
+        for left_pos, (left_bundle_index, left_row_index, left_row) in enumerate(assignment_refs):
+            left_bundle = bundles[left_bundle_index]
+            left_key = left_bundle["task_id_list_str"]
+            left_score = bundle_objectives[left_bundle_index]
+            for right_bundle_index, right_row_index, right_row in assignment_refs[left_pos + 1 :]:
+                if right_bundle_index == left_bundle_index:
+                    continue
+                right_bundle = bundles[right_bundle_index]
+                right_key = right_bundle["task_id_list_str"]
+                left_replacement = rows_by_key.get((left_key, right_row[2]))
+                right_replacement = rows_by_key.get((right_key, left_row[2]))
+                if left_replacement is None or right_replacement is None:
+                    continue
+                if right_row[2] in {row[2] for idx, row in enumerate(left_bundle["rows"]) if idx != left_row_index}:
+                    continue
+                if left_row[2] in {row[2] for idx, row in enumerate(right_bundle["rows"]) if idx != right_row_index}:
+                    continue
+                left_after = list(left_bundle["rows"])
+                right_after = list(right_bundle["rows"])
+                left_after[left_row_index] = left_replacement
+                right_after[right_row_index] = right_replacement
+                gain = (
+                    left_score
+                    + bundle_objectives[right_bundle_index]
+                    - objective(left_after, left_key)
+                    - objective(right_after, right_key)
+                )
+                if gain > best_gain:
+                    best_gain = gain
+                    best = ("swap", left_bundle_index, left_row_index, left_replacement, right_bundle_index, right_row_index, right_replacement)
+
+        if best is None:
+            break
+
+        if best[0] == "replace":
+            _kind, bundle_index, row_index, candidate = best
+            bundles[bundle_index]["rows"][row_index] = candidate
+            bundle_objectives[bundle_index] = objective(bundles[bundle_index]["rows"], bundles[bundle_index]["task_id_list_str"])
+        elif best[0] == "move":
+            _kind, source_index, row_index, target_index, moved, source_after_score = best
+            bundles[source_index]["rows"].pop(row_index)
+            bundles[target_index]["rows"].append(moved)
+            bundle_objectives[source_index] = source_after_score
+            bundle_objectives[target_index] = objective(bundles[target_index]["rows"], bundles[target_index]["task_id_list_str"])
+        else:
+            (
+                _kind,
+                left_bundle_index,
+                left_row_index,
+                left_replacement,
+                right_bundle_index,
+                right_row_index,
+                right_replacement,
+            ) = best
+            bundles[left_bundle_index]["rows"][left_row_index] = left_replacement
+            bundles[right_bundle_index]["rows"][right_row_index] = right_replacement
+            bundle_objectives[left_bundle_index] = objective(
+                bundles[left_bundle_index]["rows"], bundles[left_bundle_index]["task_id_list_str"]
+            )
+            bundle_objectives[right_bundle_index] = objective(
+                bundles[right_bundle_index]["rows"], bundles[right_bundle_index]["task_id_list_str"]
+            )
 
     return [
         (bundle["task_id_list_str"], [row[2] for row in sorted(bundle["rows"], key=lambda item: (item[3], -item[4], item[2]))])

@@ -1814,10 +1814,19 @@ def _finish_assignment(candidates, selected, meta, policy=None):
                 best_result = result
                 best_policy = trial_policy
 
-    if not (is_low and meta.get("candidate_count", 0) > 25000):
-        polished = _polish_assignment(candidates, best_result, meta, best_policy)
-        if _policy_score(candidates, polished, meta, best_policy) > best_key:
-            return polished
+    polished = _polish_assignment(candidates, best_result, meta, best_policy)
+    polished_key = _policy_score(candidates, polished, meta, best_policy)
+    if is_low and meta.get("candidate_count", 0) > 25000:
+        min_polish_gain = 5.0
+    elif not is_low and meta.get("candidate_count", 0) > 5000:
+        min_polish_gain = 2.0
+    else:
+        min_polish_gain = 0.0
+    if polished_key[0] > best_key[0] or (
+        polished_key[0] == best_key[0]
+        and polished_key[1] > best_key[1] + min_polish_gain
+    ):
+        return polished
     return best_result
 
 
@@ -1896,10 +1905,21 @@ def _polish_assignment(candidates, result, meta, policy=None):
 
     is_low = _is_low_willingness_case(candidates, meta)
     small_polish_case = 10 <= meta.get("task_count", 0) <= 18 and meta.get("candidate_count", 0) <= 5000
-    if not is_low and not small_polish_case:
+    general_polish_case = (
+        not is_low
+        and meta.get("courier_count", 0) / max(meta.get("task_count", 1), 1) >= 1.25
+        and 20 <= meta.get("task_count", 0) <= 40
+        and meta.get("candidate_count", 0) <= 70000
+    )
+    if not is_low and not small_polish_case and not general_polish_case:
         return result
 
-    time_limit = 0.25 if small_polish_case and not is_low else 0.8
+    if small_polish_case and not is_low:
+        time_limit = 0.25
+    elif general_polish_case:
+        time_limit = 0.45
+    else:
+        time_limit = 0.8
     start = perf_counter()
     rows_by_key = {(candidate[1], candidate[2]): candidate for candidate in candidates}
     reject_penalty = _reject_penalty(meta)

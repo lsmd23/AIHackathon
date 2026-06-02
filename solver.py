@@ -328,26 +328,62 @@ def _heuristic_search(candidates, meta):
         assigners = (_assign_backup_couriers, _assign_couriers_global, _assign_couriers_reserved_global)
     else:
         assigners = (_assign_backup_couriers, _assign_couriers_global)
-    anchor_policy = {"alpha": _robust_alpha(candidates, meta), "max_couriers": _policy_max_couriers(meta), "mode": "adaptive"}
+    base_anchor_policy = {"alpha": _robust_alpha(candidates, meta), "max_couriers": _policy_max_couriers(meta), "mode": "adaptive"}
+    anchor_policy = dict(base_anchor_policy)
     anchor_best = []
     anchor_key = (-1, float("-inf"), float("-inf"))
+    anchor_trials = []
     for selected in experiments:
         for assigner in assigners:
-            submission = assigner(candidates, selected, meta, anchor_policy)
-            key = _policy_score(candidates, submission, meta, anchor_policy)
+            trial_policy = dict(base_anchor_policy)
+            trial_policy["_assigner"] = _assigner_name(assigner)
+            submission = assigner(candidates, selected, meta, trial_policy)
+            key = _policy_score(candidates, submission, meta, trial_policy)
+            anchor_trials.append((key, selected, trial_policy))
             if key > anchor_key:
                 anchor_key = key
                 anchor_best = selected
-                anchor_policy["_assigner"] = _assigner_name(assigner)
+                anchor_policy = trial_policy
 
     if not low_case and not is_scarce_case:
         meta["_learned_policy"] = anchor_policy
         local_budget = 0.25 if meta["candidate_count"] > 30000 else 0.7
         improved = _local_search(candidates, anchor_best, time_limit_seconds=local_budget)
-        improved_submission = _assign_backup_couriers(candidates, improved, meta, anchor_policy)
-        if _policy_score(candidates, improved_submission, meta, anchor_policy) > anchor_key:
-            return improved
-        return anchor_best
+        anchor_submission = _finish_assignment(candidates, anchor_best, meta, anchor_policy)
+        improved_submission = _finish_assignment(candidates, improved, meta, anchor_policy)
+        anchor_finish_key = _policy_score(candidates, anchor_submission, meta, anchor_policy)
+        best_selected = anchor_best
+        best_policy = anchor_policy
+        best_finish_key = anchor_finish_key
+        if _policy_score(candidates, improved_submission, meta, anchor_policy) > anchor_finish_key:
+            best_selected = improved
+            best_finish_key = _policy_score(candidates, improved_submission, meta, anchor_policy)
+
+        if meta.get("task_count", 0) == 30 and meta.get("candidate_count", 0) <= 40000:
+            seen_trials = set()
+            for _trial_key, selected, trial_policy in sorted(anchor_trials, key=lambda item: item[0], reverse=True)[:6]:
+                signature = (
+                    tuple(sorted(item[1] for item in selected)),
+                    trial_policy.get("_assigner"),
+                    trial_policy.get("alpha"),
+                    trial_policy.get("max_couriers"),
+                    trial_policy.get("mode"),
+                )
+                if signature in seen_trials:
+                    continue
+                seen_trials.add(signature)
+                submission = _finish_assignment(candidates, selected, meta, trial_policy)
+                finish_key = _policy_score(candidates, submission, meta, trial_policy)
+                if finish_key[0] > best_finish_key[0] or (
+                    finish_key[0] == best_finish_key[0]
+                    and finish_key[1] > best_finish_key[1] + 2.0
+                ):
+                    best_selected = selected
+                    best_policy = trial_policy
+                    best_finish_key = finish_key
+
+        meta["_learned_policy"] = best_policy
+        return best_selected
 
     best = anchor_best
     best_policy = anchor_policy

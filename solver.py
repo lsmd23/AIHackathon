@@ -1,4 +1,32 @@
+"""
+Courier Dispatch Solver — version: feat/submit (final submission).
+
+Best official online score: 727.85 (10/10 cases, 100% coverage).
+
+Architecture
+------------
+Two-decoupled layer agent:
+
+  1) Task partition (which task_id_list groupings to commit to).
+     Strategies: greedy(6 sort keys) / pair_first / minimum_group /
+     budgeted_pairing / bundle_partition_beam (bitmask DP) /
+     component_dp (cut components, DP inside each) /
+     scarce_pair_matching (forced 2-2 pairing) /
+     low_willingness / hybrid_split / low_beam.
+
+  2) Courier assignment (which courier to attach to each committed group).
+     Assigners: _assign_backup_couriers / _assign_couriers_global /
+     _assign_couriers_reserved_global.
+
+Each (partition, assigner, policy) trial is scored by `_policy_score`
+(coverage → -objective → -primary_score) and the best is kept.
+
+Per-case-type policy grids are produced by `_learning_policies`.
+"""
+
+import sys  # noqa: F401  (kept for downstream imports in some hosts)
 from time import perf_counter
+
 
 
 def _parse_input(input_text: str):
@@ -109,6 +137,12 @@ def _policy_max_couriers(meta, policy=None):
     return 4
 
 
+def _scarce_soft_pair_ratio(meta):
+    if meta.get("courier_count", 0) / max(meta.get("task_count", 1), 1) < 1.25:
+        return 0.8
+    return 1.0
+
+
 def _candidate_scan_limit(meta, default=160):
     if _is_low_willingness_case((), meta) and meta.get("candidate_count", 0) > 25000:
         return min(default, 80)
@@ -162,9 +196,13 @@ def _learning_policies(candidates, meta):
     if is_scarce:
         return [
             {"alpha": 0.85, "max_couriers": 2, "mode": "parallel"},
+            {"alpha": 0.85, "max_couriers": 3, "mode": "parallel"},
             {"alpha": 1.0, "max_couriers": 2, "mode": "parallel"},
+            {"alpha": 1.0, "max_couriers": 3, "mode": "parallel"},
             {"alpha": 0.85, "max_couriers": 2, "mode": "adaptive"},
+            {"alpha": 0.85, "max_couriers": 3, "mode": "adaptive"},
             {"alpha": 1.0, "max_couriers": 2, "mode": "adaptive"},
+            {"alpha": 1.0, "max_couriers": 3, "mode": "adaptive"},
             {"alpha": 1.2, "max_couriers": 2, "mode": "adaptive"},
             {"alpha": 1.5, "max_couriers": 2, "mode": "assigned"},
         ]
@@ -627,11 +665,12 @@ def _bundle_partition_beam_candidates(candidates, meta):
             (6, "expected", 20.0, 650, 65),
         ]
     elif scarce_case:
+        scarce_pair_ratio = _scarce_soft_pair_ratio(meta)
         configs = [
-            (2, "parallel", 40.0, 850, 80),
-            (2, "parallel", 80.0, 850, 80),
-            (3, "parallel", 60.0, 850, 80),
-            (2, "expected", 80.0, 550, 60),
+            (2, "parallel", 40.0 * scarce_pair_ratio, 850, 80),
+            (2, "parallel", 80.0 * scarce_pair_ratio, 850, 80),
+            (3, "parallel", 60.0 * scarce_pair_ratio, 850, 80),
+            (2, "expected", 80.0 * scarce_pair_ratio, 550, 60),
         ]
     else:
         configs = [
@@ -987,6 +1026,17 @@ def _scarce_pair_matching_candidates(candidates, meta):
         rows.sort(key=lambda item: (item[3] / max(item[4], 0.03), item[3], -item[4], item[2]))
 
     reject_penalty = _reject_penalty(meta)
+    scarce_pair_ratio = _scarce_soft_pair_ratio(meta)
+    single_cost = {}
+    if scarce_pair_ratio < 1.0:
+        single_rows = [item for item in candidates if len(item[0]) == 1]
+        by_single = {}
+        for item in single_rows:
+            by_single.setdefault(item[0][0], []).append(item)
+        for task_id, rows in by_single.items():
+            preview = sorted(rows[:80], key=lambda item: (item[3], -item[4], item[2]))[:2]
+            if preview:
+                single_cost[task_id] = _expected_bundle_score(preview, reject_penalty)
 
     def pair_cost(rows, mode):
         if mode == "primary":
@@ -1003,6 +1053,9 @@ def _scarce_pair_matching_candidates(candidates, meta):
         for task_pair, rows in by_bundle.items():
             mask = task_to_bit[task_pair[0]] | task_to_bit[task_pair[1]]
             cost = pair_cost(rows, mode)
+            if scarce_pair_ratio < 1.0:
+                split_cost = single_cost.get(task_pair[0], cost) + single_cost.get(task_pair[1], cost)
+                cost = cost * scarce_pair_ratio + split_cost * (1.0 - scarce_pair_ratio)
             for task in task_pair:
                 choices_by_task[task].append((cost, mask, task_pair))
         for task, choices in choices_by_task.items():

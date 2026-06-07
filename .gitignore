@@ -1,3 +1,4 @@
+# Python
 .venv/
 __pycache__/
 *.py[cod]
@@ -10,5 +11,22 @@ dist/
 outputs/
 .env
 .env.*
-/.claude
+
+# OS
 .DS_Store
+
+# Claude Code session state
+/.claude
+
+# Frontend (Vue + Vite)
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/.cache/
+
+# IDE
+.idea/
+.vscode/
+
+# Logs
+*.log

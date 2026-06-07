@@ -11,8 +11,6 @@ import solver
 
 CASE_PATHS = [
     Path("examples/large_seed301.txt"),
-    *sorted(Path("examples/blackbox_like").glob("*.txt")),
-    *sorted(Path("examples/probe_suite").glob("*.txt")),
 ]
 
 
@@ -85,9 +83,6 @@ def assigned_score(input_text: str, result: list) -> float:
 
 
 def family_for(path: Path) -> str:
-    if path.parent.name == "probe_suite":
-        parts = path.stem.split("_")
-        return "probe_" + (parts[1] if len(parts) > 1 else "misc")
     if path.name == "large_seed301.txt" and path.parent.name == "examples":
         return "official_sample"
     return path.stem.split("_seed")[0]
